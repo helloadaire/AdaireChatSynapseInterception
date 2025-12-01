@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Matrix Debug Monitor</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .event { border: 1px solid #ddd; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .encrypted { background-color: #fff3cd; }
+        .decrypted { background-color: #d1ecf1; }
+        .error { background-color: #f8d7da; }
+        .sender { font-weight: bold; }
+        .room { color: #666; font-size: 0.9em; }
+        .body { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 3px; }
+        .timestamp { color: #999; font-size: 0.8em; }
+        .controls { margin: 20px 0; padding: 10px; background: #e9ecef; border-radius: 5px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <h1>Matrix CRM Interceptor - Debug Monitor</h1>
+    
+    <div class="controls">
+        <button onclick="loadEvents()">Refresh Events</button>
+        <button onclick="clearEvents()">Clear Events</button>
+        <button onclick="toggleAutoRefresh()">Auto Refresh: <span id="autoRefreshStatus">Off</span></button>
+        <button onclick="testSend()">Send Test Message</button>
+        <button onclick="window.location.href='/monitor'">Go to Monitor</button>
+    </div>
+    
+    <div id="events"></div>
+    
+    <script>
+        let autoRefreshInterval = null;
+        
+        async function loadEvents() {
+            const response = await fetch('/debug/events?limit=100');
+            const data = await response.json();
+            const container = document.getElementById('events');
+            
+            container.innerHTML = `<h3>Total Events: ${data.total_events}</h3>`;
+            
+            data.events.reverse().forEach(event => {
+                const eventData = event.data;
+                const div = document.createElement('div');
+                div.className = 'event ' + (eventData.decrypted ? 'decrypted' : 'encrypted');
+                
+                let bodyContent = eventData.body || 'No body';
+                if (bodyContent.length > 500) {
+                    bodyContent = bodyContent.substring(0, 500) + '...';
+                }
+                
+                div.innerHTML = `
+                    <div class="sender">👤 ${eventData.sender || 'Unknown'}</div>
+                    <div class="room">🏠 Room: ${eventData.room_id || 'Unknown'}</div>
+                    <div class="timestamp">⏰ ${event.timestamp}</div>
+                    <div class="body">
+                        <strong>Message:</strong><br>
+                        <pre>${bodyContent}</pre>
+                    </div>
+                    <div><small>Type: ${eventData.message_type || 'unknown'}</small></div>
+                    <div><small>Event ID: ${eventData.event_id || 'unknown'}</small></div>
+                `;
+                
+                container.appendChild(div);
+            });
+        }
+        
+        function clearEvents() {
+            document.getElementById('events').innerHTML = '';
+        }
+        
+        function toggleAutoRefresh() {
+            const status = document.getElementById('autoRefreshStatus');
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+                status.textContent = 'Off';
+            } else {
+                autoRefreshInterval = setInterval(loadEvents, 2000);
+                status.textContent = 'On';
+            }
+        }
+        
+        function testSend() {
+            const roomId = prompt('Enter room ID:');
+            const message = prompt('Enter message:');
+            if (roomId && message) {
+                fetch('/test/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({room_id: roomId, message: message})
+                }).then(response => {
+                    if (response.ok) {
+                        alert('Message sent successfully!');
+                        loadEvents();
+                    } else {
+                        response.json().then(data => alert('Error: ' + JSON.stringify(data)));
+                    }
+                });
+            }
+        }
+        
+        // WebSocket connection for real-time updates
+        const ws = new WebSocket(`ws://${window.location.host}/ws/events`);
+        ws.onmessage = function(event) {
+            console.log('WebSocket event:', event.data);
+        };
+        
+        // Load events on page load
+        loadEvents();
+    </script>
+</body>
+</html>

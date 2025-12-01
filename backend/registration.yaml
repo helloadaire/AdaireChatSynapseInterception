@@ -1,0 +1,13 @@
+id: "adaire_crm"
+url: "http://localhost:8000/_matrix/app/v1"
+as_token: "your_generated_as_token_here"
+hs_token: "your_generated_hs_token_here"
+sender_localpart: "crmbot"
+namespaces:
+  users:
+    - exclusive: true
+      regex: "@crmbot_.*"
+  rooms: []
+  aliases: []
+rate_limited: false
+protocols: []

@@ -1,0 +1,404 @@
+from nio import AsyncClient, MatrixRoom, RoomMessageText
+from nio.client import ClientConfig
+from typing import Optional, Callable, Dict, Any
+import asyncio
+import json
+import logging
+from datetime import datetime
+import os
+
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+class MatrixClient:
+    """Wrapper around matrix-nio client for CRM integration"""
+    
+    def __init__(self):
+        self.client: Optional[AsyncClient] = None
+        self.syncing = False
+        self._message_callbacks = []
+        self._sync_token = None
+        self._store_path = "./matrix_store"
+        
+    async def initialize(self):
+        """Initialize Matrix client connection with proper configuration"""
+        try:
+            logger.info(f"🚀 Initializing Matrix client for {settings.matrix_user_id}")
+            
+            # Ensure store directory exists
+            os.makedirs(self._store_path, exist_ok=True)
+            
+            # Create proper ClientConfig object (NOT a dict)
+            config = ClientConfig(
+                # store_path="./matrix_store",
+                encryption_enabled=False,  # Disable E2EE for simplicity
+                store_sync_tokens=True,
+            )
+            
+            self.client = AsyncClient(
+                homeserver=settings.matrix_homeserver_url,
+                user=settings.matrix_user_id,
+                device_id=settings.matrix_device_id or "CRMBOT",
+                config=config
+            )
+            
+            # Disable response validation to avoid 'next_batch' errors
+            self.client.validate_response = False
+            
+            # Set access token if provided
+            if settings.matrix_access_token:
+                self.client.access_token = settings.matrix_access_token
+                self.client.user_id = settings.matrix_user_id
+                logger.info("✅ Using provided access token")
+            else:
+                logger.warning("⚠️ No access token provided. Client may not be able to sync.")
+            
+            # Add event callback for text messages only
+            self.client.add_event_callback(self._on_message, RoomMessageText)
+            
+            # Log configuration
+            logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
+            logger.info(f"👤 User ID: {settings.matrix_user_id}")
+            
+            
+            crypto_store_path = os.path.join(self._store_path, "CRYPTO_STORE")
+            if os.path.exists(crypto_store_path):
+                try:
+                    await self.client.load_store()
+                    logger.info("✅ Loaded encryption store")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not load encryption store: {e}")
+                    
+            # Start syncing
+            if self.client.access_token:
+                asyncio.create_task(self._start_syncing())
+                logger.info("🔄 Starting sync with E2EE...")
+            
+            logger.info("✅ Matrix client initialized with E2EE support")
+            
+            # Simple connection test
+            try:
+                # Just log the configuration
+                logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
+                logger.info(f"👤 User ID: {settings.matrix_user_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Connection test warning: {e}")
+            
+            # Start syncing in background if we have credentials
+            if self.client.access_token:
+                asyncio.create_task(self._start_syncing())
+                logger.info("🔄 Starting sync process...")
+            else:
+                logger.warning("⏸️ No access token. Syncing disabled.")
+            
+            logger.info("✅ Matrix client initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
+            raise
+    
+    
+    async def _handle_encrypted_event(self, room_id: str, event):
+        """Handle encrypted MegolmEvent"""
+        try:
+            logger.info(f"🔐 Encrypted event in room {room_id} from {event.sender}")
+            
+            # Check if we can decrypt it
+            if hasattr(event, 'decrypted') and event.decrypted:
+                # Already decrypted
+                if hasattr(event, 'body'):
+                    await self._process_decrypted_message(room_id, event)
+                else:
+                    logger.warning(f"⚠️ Event is marked as decrypted but has no body")
+            else:
+                # Try to decrypt
+                try:
+                    # The event object already has decryption methods
+                    decrypted = await self.client.decrypt_event(event)
+                    if decrypted and hasattr(decrypted, 'body'):
+                        await self._process_decrypted_message(room_id, decrypted)
+                    else:
+                        logger.warning(f"⚠️ Could not decrypt event from {event.sender}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Decryption failed: {e}")
+                    
+        except Exception as e:
+            logger.error(f"❌ Error handling encrypted event: {e}")
+            
+    async def _handle_message_event(self, room_id: str, event):
+        """Handle unencrypted message event"""
+        try:
+            # Create message data from the event object
+            message_data = {
+                "event_id": getattr(event, 'event_id', 'unknown'),
+                "room_id": room_id,
+                "sender": getattr(event, 'sender', 'unknown'),
+                "body": getattr(event, 'body', ''),
+                "message_type": "m.room.message",
+                "timestamp": getattr(event, 'server_timestamp', 0),
+                "room_name": room_id,
+                "decrypted": False
+            }
+            
+            logger.info(f"📨 Unencrypted message from {message_data['sender']}: {message_data['body'][:100]}")
+            
+            # Call callbacks
+            for callback in self._message_callbacks:
+                await callback(message_data)
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling message event: {e}")
+
+    async def _process_decrypted_message(self, room_id: str, decrypted_event):
+        """Process a successfully decrypted message"""
+        try:
+            message_data = {
+                "event_id": getattr(decrypted_event, 'event_id', 'unknown'),
+                "room_id": room_id,
+                "sender": decrypted_event.sender,
+                "body": getattr(decrypted_event, 'body', ''),
+                "message_type": "m.room.message",
+                "timestamp": getattr(decrypted_event, 'server_timestamp', 0),
+                "room_name": room_id,
+                "decrypted": True
+            }
+            
+            logger.info(f"🔓 Decrypted message from {decrypted_event.sender}: {message_data['body'][:100]}")
+            
+            # Call callbacks
+            for callback in self._message_callbacks:
+                await callback(message_data)
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing decrypted message: {e}")
+    
+    async def _process_room_events(self, room_id: str, events: list):
+        """Process events from a room, handling encryption"""
+        for event in events:
+            try:
+                # Get event type - events are objects, not dicts
+                if hasattr(event, 'type'):
+                    event_type = event.type
+                elif hasattr(event, 'source'):
+                    # Some events have source as JSON string
+                    try:
+                        source_dict = event.source
+                        event_type = source_dict.get('type', 'unknown')
+                    except:
+                        event_type = 'unknown'
+                else:
+                    event_type = 'unknown'
+                    
+                logger.debug(f"Processing event type: {event_type} in room {room_id}")
+                
+                if event_type == 'm.room.encrypted':
+                    # Handle encrypted event
+                    await self._handle_encrypted_event(room_id, event)
+                elif event_type == 'm.room.message':
+                    # Handle unencrypted message
+                    await self._handle_message_event(room_id, event)
+                else:
+                    # Ignore other event types
+                    logger.debug(f"Ignoring event type: {event_type}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error processing room event: {e}")
+    
+    async def _try_decrypt_event(self, room_id: str, event: dict):
+        """Attempt to decrypt an encrypted event"""
+        try:
+            # Use client's decrypt method
+            decrypted = await self.client.decrypt_event(event)
+            return decrypted
+        except Exception as e:
+            logger.warning(f"⚠️ Decryption failed for event in {room_id}: {e}")
+            return None
+    
+    async def _handle_decrypted_message(self, room_id: str, decrypted_event):
+        """Handle a decrypted message"""
+        try:
+            # Create mock room object
+            class MockRoom:
+                def __init__(self, room_id):
+                    self.room_id = room_id
+                    self.display_name = room_id
+            
+            mock_room = MockRoom(room_id)
+            
+            # Create message data
+            message_data = {
+                "event_id": getattr(decrypted_event, 'event_id', 'unknown'),
+                "room_id": room_id,
+                "sender": decrypted_event.sender,
+                "body": getattr(decrypted_event, 'body', ''),
+                "message_type": "m.room.message",
+                "timestamp": getattr(decrypted_event, 'server_timestamp', 0),
+                "room_name": room_id,
+                "decrypted": True
+            }
+            
+            logger.info(f"🔓 Decrypted message from {decrypted_event.sender}: {message_data['body'][:100]}")
+            
+            # Call callbacks
+            for callback in self._message_callbacks:
+                await callback(message_data)
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling decrypted message: {e}")
+    
+    async def _start_syncing(self):
+        """Start syncing with Matrix server (simplified for reliability)"""
+        self.syncing = True
+        logger.info("🔄 Starting Matrix sync loop...")
+        
+        # Continuous sync loop
+        while self.syncing:
+            try:
+                # Simple sync without complex parameters
+                sync_response = await self.client.sync(
+                    timeout=30000,  # 30 seconds timeout
+                    since=self._sync_token,
+                    full_state=False  # Don't request full state every time
+                )
+                
+                if sync_response:
+                    # Update sync token
+                    if hasattr(sync_response, 'next_batch'):
+                        self._sync_token = sync_response.next_batch
+                    
+                    # Process joined rooms
+                    for room_id, room_info in sync_response.rooms.join.items():
+                        await self._process_room_events(room_id, room_info.timeline.events)
+                    
+                    # Process to_device events (for E2EE)
+                    if hasattr(sync_response, 'to_device'):
+                        await self._process_to_device_events(sync_response.to_device.events)
+                else:
+                    logger.warning("⚠️ Empty sync response received")
+                
+                # Wait before next sync to avoid rate limiting
+                await asyncio.sleep(10)
+                    
+            except asyncio.CancelledError:
+                logger.info("🛑 Sync task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"❌ Matrix sync error: {e}")
+                # Wait longer on error
+                await asyncio.sleep(30)
+    
+    async def _on_message(self, room: MatrixRoom, event: RoomMessageText):
+        """Handle incoming Matrix text messages"""
+        try:
+            # Skip if it's our own message
+            if event.sender == self.client.user_id:
+                return
+            
+            # Create message data structure
+            message_data = {
+                "event_id": event.event_id,
+                "room_id": room.room_id,
+                "sender": event.sender,
+                "body": event.body,
+                "message_type": "m.room.message",
+                "timestamp": event.server_timestamp,
+                "room_name": room.display_name or room.room_id,
+                "msgtype": getattr(event, 'msgtype', 'm.text'),
+                "formatted_body": getattr(event, 'formatted_body', None),
+            }
+            
+            # Log the message
+            body_preview = message_data['body']
+            if len(body_preview) > 100:
+                body_preview = body_preview[:100] + "..."
+            
+            logger.info(f"📨 Message from {event.sender} in room {room.room_id}")
+            logger.info(f"   Content: {body_preview}")
+            
+            # Call all registered callbacks
+            for callback in self._message_callbacks:
+                try:
+                    await callback(message_data)
+                except Exception as e:
+                    logger.error(f"❌ Callback error: {e}")
+                    
+        except Exception as e:
+            logger.error(f"❌ Error processing Matrix message: {e}")
+    
+    def add_message_callback(self, callback: Callable):
+        """Add callback for incoming messages"""
+        self._message_callbacks.append(callback)
+        logger.info(f"✅ Added message callback. Total callbacks: {len(self._message_callbacks)}")
+    
+    async def send_message(self, room_id: str, message: str, formatted_body: Optional[str] = None):
+        """Send message to Matrix room"""
+        try:
+            content = {
+                "msgtype": "m.text",
+                "body": message
+            }
+            
+            if formatted_body:
+                content["format"] = "org.matrix.custom.html"
+                content["formatted_body"] = formatted_body
+            
+            logger.info(f"📤 Sending message to room {room_id}: {message[:50]}...")
+            
+            response = await self.client.room_send(
+                room_id=room_id,
+                message_type="m.room.message",
+                content=content
+            )
+            
+            logger.info(f"✅ Message sent to {room_id}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send message to {room_id}: {e}")
+            raise
+    
+    async def join_room(self, room_id_or_alias: str):
+        """Join a Matrix room"""
+        try:
+            response = await self.client.join(room_id_or_alias)
+            logger.info(f"✅ Joined room: {room_id_or_alias}")
+            return response
+        except Exception as e:
+            logger.error(f"❌ Failed to join room {room_id_or_alias}: {e}")
+            raise
+    
+    async def create_room(self, name: str, invitees: Optional[list] = None, **kwargs):
+        """Create a new Matrix room"""
+        try:
+            response = await self.client.room_create(
+                name=name,
+                invite=invitees or [],
+                **kwargs
+            )
+            room_id = response.room_id
+            logger.info(f"✅ Created room {room_id} with name: {name}")
+            return room_id
+        except Exception as e:
+            logger.error(f"❌ Failed to create room: {e}")
+            raise
+    
+    async def get_joined_rooms(self):
+        """Get list of rooms the client has joined"""
+        try:
+            response = await self.client.joined_rooms()
+            return response.rooms if hasattr(response, 'rooms') else []
+        except Exception as e:
+            logger.error(f"❌ Failed to get joined rooms: {e}")
+            return []
+    
+    async def close(self):
+        """Close Matrix client connection"""
+        logger.info("🛑 Closing Matrix client...")
+        self.syncing = False
+        if self.client:
+            await self.client.close()
+        logger.info("✅ Matrix client closed")
+
+# Global instance
+matrix_client = MatrixClient()

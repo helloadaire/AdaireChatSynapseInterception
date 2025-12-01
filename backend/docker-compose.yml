@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  matrix-crm-interceptor:
+    build: .
+    container_name: matrix-crm-interceptor
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MATRIX_HOMESERVER_URL=${MATRIX_HOMESERVER_URL}
+      - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN}
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - ODOO_URL=${ODOO_URL}
+      - ODOO_DATABASE=${ODOO_DATABASE}
+      - ODOO_USERNAME=${ODOO_USERNAME}
+      - ODOO_PASSWORD=${ODOO_PASSWORD}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./matrix_store:/app/matrix_store
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - matrix-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: matrix-crm-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - matrix-network
+
+networks:
+  matrix-network:
+    driver: bridge
+
+volumes:
+  redis-data:

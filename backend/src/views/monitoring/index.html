@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Matrix CRM Interceptor Monitor</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            .message { border: 1px solid #ddd; padding: 10px; margin: 10px 0; border-radius: 5px; }
+            .sender { font-weight: bold; color: #333; }
+            .room { color: #666; font-size: 0.9em; }
+            .body { margin: 5px 0; }
+            .timestamp { color: #999; font-size: 0.8em; }
+            .refresh { margin: 20px 0; }
+        </style>
+        <script>
+            async function loadMessages() {
+                const response = await fetch('/messages?limit=50');
+                const data = await response.json();
+                const container = document.getElementById('messages');
+                container.innerHTML = '';
+                
+                data.messages.forEach(msg => {
+                    const div = document.createElement('div');
+                    div.className = 'message';
+                    div.innerHTML = `
+                        <div class="sender">${msg.sender}</div>
+                        <div class="room">Room: ${msg.room_id}</div>
+                        <div class="body">${msg.body}</div>
+                        <div class="timestamp">${new Date(msg.timestamp).toLocaleString()}</div>
+                    `;
+                    container.appendChild(div);
+                });
+            }
+            
+            function sendTestMessage() {
+                const roomId = prompt('Enter room ID:');
+                const message = prompt('Enter message:');
+                if (roomId && message) {
+                    fetch('/test/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({room_id: roomId, message: message})
+                    }).then(response => response.json())
+                      .then(data => alert('Sent: ' + JSON.stringify(data)));
+                }
+            }
+            
+            setInterval(loadMessages, 5000);
+            window.onload = loadMessages;
+        </script>
+    </head>
+    <body>
+        <h1>Matrix CRM Interceptor Monitor</h1>
+        <div class="refresh">
+            <button onclick="loadMessages()">Refresh</button>
+            <button onclick="sendTestMessage()">Send Test Message</button>
+            <button onclick="window.location.href='/health'">Health Check</button>
+            <button onclick="window.location.href='/matrix/status'">Matrix Status</button>
+        </div>
+        <div id="messages"></div>
+    </body>
+    </html>
