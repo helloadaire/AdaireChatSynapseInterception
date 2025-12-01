@@ -8,7 +8,7 @@ matrix-nio==0.21.2
 aiohttp==3.9.1
 
 # Odoo
-odoo-client-lib==2.0.0
+odoo-client-lib
 requests==2.31.0
 
 # Database & ORM (Optional)
