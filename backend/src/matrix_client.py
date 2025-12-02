@@ -68,7 +68,7 @@ class MatrixClient:
             # IMPORTANT: Initialize encryption BEFORE syncing
             await self._initialize_encryption()
             
-            await self._import_recovery_key_if_exists()
+            await self.import_recovery_key()
             
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
@@ -120,10 +120,6 @@ class MatrixClient:
             # Also save it for future use
             crypto_store_path = os.path.join(self._store_path, "crypto")
             os.makedirs(crypto_store_path, exist_ok=True)
-            
-            recovery_key_path = os.path.join(crypto_store_path, "recovery_key.txt")
-            async with aiofiles.open(recovery_key_path, "w") as f:
-                await f.write(recovery_key)
                 
         except Exception as e:
             logger.error(f"❌ Failed to import recovery key: {e}")
