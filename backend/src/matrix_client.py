@@ -68,7 +68,14 @@ class MatrixClient:
             # IMPORTANT: Initialize encryption BEFORE syncing
             await self._initialize_encryption()
             
-            await self.import_recovery_key()
+            await self._import_recovery_key_if_exists()
+            
+            # After importing keys, we should load the store again
+            try:
+                await self.client.load_store()
+                logger.info("✅ Store reloaded with recovery key")
+            except Exception as load_error:
+                logger.warning(f"⚠️ Could not reload store: {load_error}")
             
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
@@ -96,13 +103,6 @@ class MatrixClient:
                 # The passphrase is the 4S key itself
                 await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
                 logger.info("✅ Recovery key imported successfully")
-                    
-                # After importing keys, we should load the store again
-                try:
-                    await self.client.load_store()
-                    logger.info("✅ Store reloaded with recovery key")
-                except Exception as load_error:
-                    logger.warning(f"⚠️ Could not reload store: {load_error}")
                     
             except Exception as import_error:
                 logger.error(f"❌ Could not import recovery key: {import_error}")     
