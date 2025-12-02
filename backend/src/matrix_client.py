@@ -88,14 +88,21 @@ class MatrixClient:
         """Import recovery key from settings if available"""
         try:
             if hasattr(settings, 'matrix_recovery_key') and settings.matrix_recovery_key:
-                recovery_key = settings.matrix_recovery_key
+                recovery_key = settings.matrix_recovery_key.strip()
                 
                 logger.info("🔑 Importing recovery key...")
                 
-                # The recovery key might be in 4S format (space-separated words)
-                # Try to import it directly
+                # The recovery key is in 4S format (space-separated words)
+                # This is a passphrase, not a raw key
                 try:
-                    await self.client.import_keys(recovery_key)
+                    # Remove extra spaces and normalize
+                    normalized_key = " ".join(recovery_key.split())
+                    
+                    logger.info(f"Using recovery key (first few words): {normalized_key[:30]}...")
+                    
+                    # For matrix-nio, we need to use import_keys with the passphrase
+                    # The passphrase is the 4S key itself
+                    await self.client.import_keys(normalized_key)
                     logger.info("✅ Recovery key imported successfully")
                     
                     # Save recovery key to file for backup
@@ -104,26 +111,31 @@ class MatrixClient:
                     
                     recovery_key_path = os.path.join(crypto_store_path, "recovery_key.txt")
                     with open(recovery_key_path, "w") as f:
-                        f.write(recovery_key)
+                        f.write(normalized_key)
                     logger.info("💾 Recovery key saved to file")
                     
-                except Exception as import_error:
-                    logger.warning(f"⚠️ Could not import recovery key directly: {import_error}")
-                    
-                    # Try alternative approach - the key might need to be base64 decoded
+                    # After importing keys, we should load the store again
                     try:
-                        # Sometimes recovery keys are base64 encoded
-                        import base64
-                        # Remove spaces and try to decode
+                        await self.client.load_store()
+                        logger.info("✅ Store reloaded with recovery key")
+                    except Exception as load_error:
+                        logger.warning(f"⚠️ Could not reload store: {load_error}")
+                    
+                except Exception as import_error:
+                    logger.error(f"❌ Could not import recovery key: {import_error}")
+                    
+                    # Try alternative: maybe it's a base64 key without spaces
+                    try:
+                        logger.info("🔄 Trying alternative import method...")
+                        
+                        # Remove all spaces
                         key_without_spaces = recovery_key.replace(" ", "")
-                        if len(key_without_spaces) % 4 == 0:  # Looks like base64
-                            decoded_key = base64.b64decode(key_without_spaces)
-                            await self.client.import_keys(decoded_key.decode('utf-8'))
-                            logger.info("✅ Recovery key imported (base64 decoded)")
-                        else:
-                            logger.warning("⚠️ Recovery key format not recognized")
-                    except Exception as decode_error:
-                        logger.error(f"❌ Could not decode recovery key: {decode_error}")
+                        
+                        # Try as passphrase without spaces
+                        await self.client.import_keys(key_without_spaces)
+                        logger.info("✅ Recovery key imported (without spaces)")
+                    except Exception as alt_error:
+                        logger.error(f"❌ Alternative import also failed: {alt_error}")
             else:
                 logger.info("ℹ️ No recovery key configured in settings")
                 
