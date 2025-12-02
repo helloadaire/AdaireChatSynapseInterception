@@ -10,6 +10,8 @@ import aiofiles
 import pickle
 import os
 
+ELEMENT_KEY_PASSPHRASE='IWxCmrVzpjSfqicBIu'
+
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,8 @@ class MatrixClient:
             # IMPORTANT: Initialize encryption BEFORE syncing
             await self._initialize_encryption()
             
+            await self._import_recovery_key_if_exists()
+            
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
             logger.info(f"👤 User ID: {settings.matrix_user_id}")
@@ -80,12 +84,36 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
-
+    
+    async def _import_recovery_key_if_exists(self):
+        """Import recovery key from settings if available"""
+        try:
+            try:
+                keys_path = os.path.join(self._store_path, 'element-keys.txt')
+                logger.info(f"Using key at location: {keys_path}")
+                    
+                # For matrix-nio, we need to use import_keys with the passphrase
+                # The passphrase is the 4S key itself
+                await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
+                logger.info("✅ Recovery key imported successfully")
+                    
+                # After importing keys, we should load the store again
+                try:
+                    await self.client.load_store()
+                    logger.info("✅ Store reloaded with recovery key")
+                except Exception as load_error:
+                    logger.warning(f"⚠️ Could not reload store: {load_error}")
+                    
+            except Exception as import_error:
+                logger.error(f"❌ Could not import recovery key: {import_error}")     
+        except Exception as e:
+            logger.error(f"❌ Error importing recovery key: {e}")
+    
     async def import_recovery_key(self, recovery_key: str):
         """Import a recovery key to decrypt historical messages"""
         try:
             # The recovery key is usually a base64-encoded string
-            await self.client.import_keys(recovery_key)
+            await self.client.import_keys(,recovery_key)
             logger.info("✅ Recovery key imported")
             
             # Also save it for future use
