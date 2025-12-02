@@ -278,6 +278,8 @@ class MatrixClient:
                     full_state=False  # Don't request full state every time
                 )
                 
+                print(sync_response)
+                
                 # Check if sync_response is an error
                 if hasattr(sync_response, 'error'):
                     logger.error(f"❌ Sync error: {sync_response.error}")
