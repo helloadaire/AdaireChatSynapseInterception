@@ -23,6 +23,7 @@ class MatrixClient:
         self._message_callbacks = []
         self._sync_token = None
         self._store_path = "./matrix_store"
+        self._cypher_path = os.path(self._store_path, 'cypher.key')
     
 
     async def initialize(self):
@@ -32,6 +33,7 @@ class MatrixClient:
             
             # Ensure store directory exists
             os.makedirs(self._store_path, exist_ok=True)
+            
             
             # Create proper ClientConfig object
             config = ClientConfig(
@@ -102,7 +104,7 @@ class MatrixClient:
                     
                     # For matrix-nio, we need to use import_keys with the passphrase
                     # The passphrase is the 4S key itself
-                    await self.client.import_keys(normalized_key, normalized_key)
+                    await self.client.import_keys(self._cypher_path, normalized_key)
                     logger.info("✅ Recovery key imported successfully")
                     
                     # Save recovery key to file for backup
@@ -132,7 +134,7 @@ class MatrixClient:
                         key_without_spaces = recovery_key.replace(" ", "")
                         
                         # Try as passphrase without spaces
-                        await self.client.import_keys(key_without_spaces)
+                        await self.client.import_keys(self._cypher_path, key_without_spaces)
                         logger.info("✅ Recovery key imported (without spaces)")
                     except Exception as alt_error:
                         logger.error(f"❌ Alternative import also failed: {alt_error}")
@@ -146,7 +148,7 @@ class MatrixClient:
         """Import a recovery key to decrypt historical messages"""
         try:
             # The recovery key is usually a base64-encoded string
-            await self.client.import_keys(recovery_key)
+            await self.client.import_keys(self._cypher_path, recovery_key)
             logger.info("✅ Recovery key imported")
             
             # Also save it for future use
