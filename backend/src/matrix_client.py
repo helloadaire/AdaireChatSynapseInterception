@@ -264,7 +264,7 @@ class MatrixClient:
             logger.error(f"❌ Error handling decrypted message: {e}")
     
     async def _start_syncing(self):
-        """Start syncing with Matrix server (simplified for reliability)"""
+        """Start syncing with Matrix server"""
         self.syncing = True
         logger.info("🔄 Starting Matrix sync loop...")
         
@@ -278,7 +278,13 @@ class MatrixClient:
                     full_state=False  # Don't request full state every time
                 )
                 
-                if sync_response:
+                # Check if sync_response is an error
+                if hasattr(sync_response, 'error'):
+                    logger.error(f"❌ Sync error: {sync_response.error}")
+                    await asyncio.sleep(30)
+                    continue
+                    
+                if hasattr(sync_response, 'rooms') and hasattr(sync_response.rooms, 'join'):
                     # Update sync token
                     if hasattr(sync_response, 'next_batch'):
                         self._sync_token = sync_response.next_batch
@@ -291,16 +297,16 @@ class MatrixClient:
                     if hasattr(sync_response, 'to_device'):
                         await self._process_to_device_events(sync_response.to_device.events)
                 else:
-                    logger.warning("⚠️ Empty sync response received")
+                    logger.warning("⚠️ Sync response missing rooms data")
                 
-                # Wait before next sync to avoid rate limiting
+                # Wait before next sync
                 await asyncio.sleep(10)
                     
             except asyncio.CancelledError:
                 logger.info("🛑 Sync task cancelled")
                 break
             except Exception as e:
-                logger.error(f"❌ Matrix sync error: {e}")
+                logger.error(f"❌ Matrix sync error: {e}", exc_info=True)
                 # Wait longer on error
                 await asyncio.sleep(30)
     
