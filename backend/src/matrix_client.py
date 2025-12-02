@@ -40,9 +40,6 @@ class MatrixClient:
             crypto_store_path = os.path.join(self._store_path, "crypto")
             os.makedirs(crypto_store_path, exist_ok=True)
 
-            # First, check if we need to restore from backup keys
-            await self._restore_from_backup_if_needed()
-
             # Create proper ClientConfig object
             config = ClientConfig(
                 encryption_enabled=True,  # Enable E2EE
@@ -98,16 +95,6 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
-
-    async def _restore_from_backup_if_needed(self):
-        """Check for and restore from backup keys if available"""
-        try:
-            backup_path = os.path.join(self._store_path, "crypto", "account.pickle")
-            if os.path.exists(backup_path):
-                logger.info("🔍 Found existing crypto backup, will attempt to restore")
-                # The store will be loaded when AsyncClient is initialized
-        except Exception as e:
-            logger.warning(f"⚠️ Could not check for backup: {e}")
 
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available"""
@@ -213,6 +200,8 @@ class MatrixClient:
             if initial_sync and hasattr(initial_sync, 'next_batch'):
                 self._sync_token = initial_sync.next_batch
                 logger.info(f"📝 Initial sync token: {self._sync_token}")
+            else:
+                logger.warning("⚠️ No next_batch in initial sync")
         except Exception as e:
             logger.error(f"❌ Initial sync failed: {e}")
 
