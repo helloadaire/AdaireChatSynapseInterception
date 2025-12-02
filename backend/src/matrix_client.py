@@ -12,6 +12,8 @@ import os
 
 from config.settings import settings
 
+ELEMENT_KEY_PASSPHRASE='IWxCmrVzpjSfqicBIu'
+
 logger = logging.getLogger(__name__)
 
 class MatrixClient:
@@ -98,11 +100,12 @@ class MatrixClient:
                     # Remove extra spaces and normalize
                     normalized_key = " ".join(recovery_key.split())
                     
-                    logger.info(f"Using recovery key (first few words): {normalized_key[:30]}...")
+                    keys_path = os.path.join(self._store_path, 'element-keys.txt')
+                    logger.info(f"Using key at location: {keys_path}")
                     
                     # For matrix-nio, we need to use import_keys with the passphrase
                     # The passphrase is the 4S key itself
-                    await self.client.import_keys(normalized_key)
+                    await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
                     logger.info("✅ Recovery key imported successfully")
                     
                     # Save recovery key to file for backup
@@ -132,10 +135,10 @@ class MatrixClient:
                         key_without_spaces = recovery_key.replace(" ", "")
                         
                         # Try as passphrase without spaces
-                        await self.client.import_keys(key_without_spaces)
-                        logger.info("✅ Recovery key imported (without spaces)")
+                        await self.client.import_keys(os.path.join(self._store_path, 'element-keys.txt'), ELEMENT_KEY_PASSPHRASE)
+                        logger.info("Recovery key imported (without spaces)")
                     except Exception as alt_error:
-                        logger.error(f"❌ Alternative import also failed: {alt_error}")
+                        logger.error(f"Alternative import also failed: {alt_error}")
             else:
                 logger.info("ℹ️ No recovery key configured in settings")
                 
@@ -146,7 +149,7 @@ class MatrixClient:
         """Import a recovery key to decrypt historical messages"""
         try:
             # The recovery key is usually a base64-encoded string
-            await self.client.import_keys(recovery_key)
+            await self.client.import_keys(os.path.join(self._store_path, 'element-keys.txt'), ELEMENT_KEY_PASSPHRASE)
             logger.info("✅ Recovery key imported")
             
             # Also save it for future use
