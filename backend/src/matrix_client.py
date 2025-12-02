@@ -100,11 +100,12 @@ class MatrixClient:
                     # Remove extra spaces and normalize
                     normalized_key = " ".join(recovery_key.split())
                     
-                    logger.info(f"Using recovery key (first few words): {normalized_key[:30]}...")
+                    keys_path = os.path.join(self._store_path, 'element-keys.txt')
+                    logger.info(f"Using key at location: {keys_path}")
                     
                     # For matrix-nio, we need to use import_keys with the passphrase
                     # The passphrase is the 4S key itself
-                    await self.client.import_keys(os.path.join(self._store_path, 'element-keys.txt'), ELEMENT_KEY_PASSPHRASE)
+                    await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
                     logger.info("✅ Recovery key imported successfully")
                     
                     # Save recovery key to file for backup
