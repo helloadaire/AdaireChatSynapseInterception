@@ -66,6 +66,9 @@ class MatrixClient:
             # IMPORTANT: Initialize encryption BEFORE syncing
             await self._initialize_encryption()
             
+            # IMPORTANT: Import recovery key if available
+            await self._import_recovery_key_if_exists()
+            
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
             logger.info(f"👤 User ID: {settings.matrix_user_id}")
@@ -80,6 +83,52 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
+
+    async def _import_recovery_key_if_exists(self):
+        """Import recovery key from settings if available"""
+        try:
+            if hasattr(settings, 'matrix_recovery_key') and settings.matrix_recovery_key:
+                recovery_key = settings.matrix_recovery_key
+                
+                logger.info("🔑 Importing recovery key...")
+                
+                # The recovery key might be in 4S format (space-separated words)
+                # Try to import it directly
+                try:
+                    await self.client.import_keys(recovery_key)
+                    logger.info("✅ Recovery key imported successfully")
+                    
+                    # Save recovery key to file for backup
+                    crypto_store_path = os.path.join(self._store_path, "crypto")
+                    os.makedirs(crypto_store_path, exist_ok=True)
+                    
+                    recovery_key_path = os.path.join(crypto_store_path, "recovery_key.txt")
+                    with open(recovery_key_path, "w") as f:
+                        f.write(recovery_key)
+                    logger.info("💾 Recovery key saved to file")
+                    
+                except Exception as import_error:
+                    logger.warning(f"⚠️ Could not import recovery key directly: {import_error}")
+                    
+                    # Try alternative approach - the key might need to be base64 decoded
+                    try:
+                        # Sometimes recovery keys are base64 encoded
+                        import base64
+                        # Remove spaces and try to decode
+                        key_without_spaces = recovery_key.replace(" ", "")
+                        if len(key_without_spaces) % 4 == 0:  # Looks like base64
+                            decoded_key = base64.b64decode(key_without_spaces)
+                            await self.client.import_keys(decoded_key.decode('utf-8'))
+                            logger.info("✅ Recovery key imported (base64 decoded)")
+                        else:
+                            logger.warning("⚠️ Recovery key format not recognized")
+                    except Exception as decode_error:
+                        logger.error(f"❌ Could not decode recovery key: {decode_error}")
+            else:
+                logger.info("ℹ️ No recovery key configured in settings")
+                
+        except Exception as e:
+            logger.error(f"❌ Error importing recovery key: {e}")
 
     async def import_recovery_key(self, recovery_key: str):
         """Import a recovery key to decrypt historical messages"""
