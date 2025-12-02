@@ -66,9 +66,9 @@ class MatrixClient:
             self.client.add_event_callback(self._on_message, RoomMessageText)
             
             # IMPORTANT: Initialize encryption BEFORE syncing
-            await self._initialize_encryption()
-            
             await self._import_recovery_key_if_exists()
+            
+            await self._initialize_encryption()
             
             # After importing keys, we should load the store again
             try:
