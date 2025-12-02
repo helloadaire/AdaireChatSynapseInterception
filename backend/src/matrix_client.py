@@ -77,16 +77,24 @@ class MatrixClient:
                 logger.warning("🟡 No access token provided. Client may not be able to sync.")
 
             # Load store if client was created successfully
-            if self.client:
+            crypto_store_path = os.path.join(self._store_path, "crypto")
+            if os.path.exists(crypto_store_path):
                 try:
                     await self.client.load_store()
-                    logger.info("🟢 Store loaded successfully")
+                    logger.info("🟢 Loaded encryption store")
                 except Exception as e:
-                    logger.error(f"🔴 Failed to load store: {e}")
-                    raise
-            else:
-                logger.error("🔴 Client not created, cannot load store")
-                raise RuntimeError("Client not created")
+                    logger.warning(f"🟡 Could not load encryption store: {e}")
+                    
+            # if self.client:
+            #     try:
+            #         await self.client.load_store()
+            #         logger.info("🟢 Store loaded successfully")
+            #     except Exception as e:
+            #         logger.error(f"🔴 Failed to load store: {e}")
+            #         raise
+            # else:
+            #     logger.error("🔴 Client not created, cannot load store")
+            #     raise RuntimeError("Client not created")
 
             # Add event callbacks
             self.client.add_event_callback(self._on_message, RoomMessageText)
