@@ -193,14 +193,37 @@ class MatrixClient:
                 
                 # If we have access to the homeserver, query our own keys
                 if self.client.access_token:
-                    await self.client.keys_query({self.client.user_id: []})
-                    logger.info("✅ Queries device keys")
+                    # Fix: keys_query doesn't take arguments in newer versions
+                    try:
+                        await self.client.keys_query()
+                        logger.info("✅ Queried device keys")
+                    except TypeError:
+                        # Older API version
+                        await self.client.keys_query({self.client.user_id: []})
+                        logger.info("✅ Queried device keys (old API)")
             else:
                 logger.warning("⚠️ OLM not available")
                 
         except Exception as e:
             logger.error(f"❌ Failed to create crypto store: {e}")
+            
     
+    async def request_keys_from_device(self, user_id: str, device_id: str):
+        """Request encryption keys from a specific device"""
+        try:
+            logger.info(f"🔑 Requesting keys from {user_id} device {device_id}")
+            
+            # Request keys from the specific device
+            await self.client.request_room_key(
+                user_id=user_id,
+                device_id=device_id,
+                room_id="!IWxCmrVzpjSfqicBIu:staging-chat.adaire.dev"
+            )
+            
+            logger.info(f"✅ Key request sent to {user_id}:{device_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to request keys: {e}")
     
     async def _handle_encrypted_event(self, room_id: str, event):
         """Handle encrypted MegolmEvent"""
