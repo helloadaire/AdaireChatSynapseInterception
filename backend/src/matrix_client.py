@@ -108,6 +108,18 @@ class MatrixClient:
             self._initialized = False
             raise
 
+    async def request_keys_from_user(self, user_id: str):
+        """Request encryption keys from a user"""
+        try:
+            logger.info(f"🔑 Requesting keys from {user_id}")
+            
+            # Request keys for all rooms
+            await self.client.request_room_key(user_id=user_id)
+            logger.info(f"🟢 Key request sent to {user_id}")
+            
+        except Exception as e:
+            logger.error(f"🔴 Failed to request keys: {e}")
+
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available"""
         try:
@@ -135,6 +147,7 @@ class MatrixClient:
         """Handle encrypted Megolm events"""
         try:
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
+            await matrix_client.request_keys_from_user("@rok862:staging-chat.adaire.dev")
 
             # Check if we can decrypt
             if not self.client or not self.client.olm:
