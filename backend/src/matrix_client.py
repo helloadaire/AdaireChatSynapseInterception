@@ -23,7 +23,7 @@ class MatrixClient:
         self._message_callbacks = []
         self._sync_token = None
         self._store_path = "./matrix_store"
-        self._cypher_path = os.path.join(self._store_path, "cypher.key")
+        self._cypher_path = os.path.join(self._store_path, "cypher.txt")
     
 
     async def initialize(self):
