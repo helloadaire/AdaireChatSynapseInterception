@@ -41,32 +41,29 @@ class MatrixClient:
             # Ensure store directory exists
             os.makedirs(self._store_path, exist_ok=True)
 
-            # Create store directory structure
-            crypto_store_path = os.path.join(self._store_path, "crypto")
-            os.makedirs(crypto_store_path, exist_ok=True)
-
             # Create proper ClientConfig object
             config = ClientConfig(
                 encryption_enabled=True,  # Enable E2EE
                 store_sync_tokens=True,
             )
 
-            # Initialize client
-            try:
-                self.client = AsyncClient(
-                    homeserver=settings.matrix_homeserver_url,
-                    user=settings.matrix_user_id,
-                    device_id=self._device_id,
-                    store_path=self._store_path,
-                    config=config,
-                )
-                logger.info("🟢 AsyncClient created successfully")
-            except Exception as e:
-                logger.error(f"🔴 Failed to create AsyncClient: {e}")
-                raise
-
-            # Disable response validation to avoid 'next_batch' errors
+            # Initialize client with device ID from settings
+            device_id = getattr(settings, 'matrix_device_id', None) or "CRMBOT001"
+            
+            self.client = AsyncClient(
+                homeserver=settings.matrix_homeserver_url,
+                user=settings.matrix_user_id,
+                device_id=device_id,
+                store_path=self._store_path,
+                config=config,
+            )
+            logger.info("🟢 AsyncClient created successfully")
+            
+            # IMPORTANT: Disable ALL response validation
             self.client.validate_response = False
+            # Also try to disable on the transport layer if possible
+            if hasattr(self.client, 'transport') and hasattr(self.client.transport, 'validate_response'):
+                self.client.transport.validate_response = False
 
             # Set access token if provided
             if settings.matrix_access_token:
@@ -76,29 +73,16 @@ class MatrixClient:
             else:
                 logger.warning("🟡 No access token provided. Client may not be able to sync.")
 
-            # Load store if client was created successfully
-            crypto_store_path = os.path.join(self._store_path, "crypto")
-            if os.path.exists(crypto_store_path):
-                try:
-                    await self.client.load_store()
-                    logger.info("🟢 Loaded encryption store")
-                except Exception as e:
-                    logger.warning(f"🟡 Could not load encryption store: {e}")
-                    
-            # if self.client:
-            #     try:
-            #         await self.client.load_store()
-            #         logger.info("🟢 Store loaded successfully")
-            #     except Exception as e:
-            #         logger.error(f"🔴 Failed to load store: {e}")
-            #         raise
-            # else:
-            #     logger.error("🔴 Client not created, cannot load store")
-            #     raise RuntimeError("Client not created")
-
-            # Add event callbacks
+            # Add event callbacks BEFORE loading store
             self.client.add_event_callback(self._on_message, RoomMessageText)
             self.client.add_event_callback(self._on_encrypted, MegolmEvent)
+
+            # Try to load store - but don't fail if it doesn't exist
+            try:
+                await self.client.load_store()
+                logger.info("🟢 Store loaded successfully")
+            except Exception as e:
+                logger.warning(f"🟡 Could not load store (might not exist yet): {e}")
 
             # Initialize encryption
             await self._initialize_encryption()
@@ -109,7 +93,7 @@ class MatrixClient:
             # Log configuration
             logger.info(f"🔵 Configured for homeserver: {settings.matrix_homeserver_url}")
             logger.info(f"🔵 User ID: {settings.matrix_user_id}")
-            logger.info(f"🔵 Device ID: {self._device_id}")
+            logger.info(f"🔵 Device ID: {device_id}")
 
             # Start syncing
             if self.client and self.client.access_token:
@@ -220,26 +204,49 @@ class MatrixClient:
             logger.error(f"🔴 Failed to initialize encryption: {e}")
             # Don't raise - we might still be able to operate without full E2EE
 
+    async def _process_room_events(self, room_id: str, events):
+        """Process events from a room"""
+        try:
+            if not events:
+                return
+                
+            logger.debug(f"🔵 Processing {len(events)} events for room {room_id}")
+            
+            for event in events:
+                try:
+                    # Log event type
+                    event_type = None
+                    
+                    if hasattr(event, 'type'):
+                        event_type = event.type
+                    elif isinstance(event, dict) and 'type' in event:
+                        event_type = event['type']
+                    
+                    if event_type:
+                        logger.debug(f"🔵 Event type: {event_type} in room {room_id}")
+                        
+                        # Handle different event types
+                        if event_type == 'm.room.encrypted':
+                            logger.info(f"🔐 Encrypted event in {room_id}")
+                            # The _on_encrypted callback should handle this
+                        elif event_type == 'm.room.message':
+                            logger.info(f"📨 Message event in {room_id}")
+                            # The _on_message callback should handle this
+                            
+                except Exception as event_error:
+                    logger.debug(f"🟡 Error processing event: {event_error}")
+                    
+        except Exception as e:
+            logger.error(f"🔴 Error processing room events: {e}")
+    
     async def _start_syncing(self):
         """Start syncing with Matrix server"""
         self.syncing = True
         logger.info("🔄 Starting Matrix sync loop...")
 
-        # Initial sync to get token
-        try:
-            initial_sync = await self.client.sync(
-                timeout=30000,
-                full_state=True  # First sync should get full state
-            )
-            
-            if initial_sync and hasattr(initial_sync, 'next_batch'):
-                self._sync_token = initial_sync.next_batch
-                logger.info(f"🔵 Initial sync token: {self._sync_token}")
-            else:
-                logger.warning("🟡 No next_batch in initial sync")
-        except Exception as e:
-            logger.error(f"🔴 Initial sync failed: {e}")
-
+        # Don't do initial sync - just start normal sync
+        logger.info("🔵 Starting normal sync loop...")
+        
         # Continuous sync loop
         while self.syncing and self.client:
             try:
@@ -251,20 +258,71 @@ class MatrixClient:
                 )
 
                 if sync_response:
-                    # Update sync token
+                    # Try to get next_batch from different possible locations
+                    next_batch = None
+                    
+                    # Method 1: Direct attribute
                     if hasattr(sync_response, 'next_batch'):
-                        self._sync_token = sync_response.next_batch
-                        logger.debug(f"🔵 Updated sync token: {self._sync_token}")
+                        next_batch = sync_response.next_batch
+                    
+                    # Method 2: From dict if response is dict-like
+                    elif isinstance(sync_response, dict) and 'next_batch' in sync_response:
+                        next_batch = sync_response['next_batch']
+                    
+                    # Method 3: Try to parse as JSON string
+                    elif isinstance(sync_response, str):
+                        try:
+                            data = json.loads(sync_response)
+                            next_batch = data.get('next_batch')
+                        except:
+                            pass
+                    
+                    if next_batch:
+                        self._sync_token = next_batch
+                        logger.debug(f"🔵 Updated sync token: {self._sync_token[:20]}..." if self._sync_token else "None")
                     else:
-                        logger.warning("🟡 Sync response missing next_batch")
-
-                    # Log room activity
-                    if hasattr(sync_response, 'rooms'):
-                        if hasattr(sync_response.rooms, 'join'):
-                            for room_id in sync_response.rooms.join.keys():
-                                logger.debug(f"🔵 Active room: {room_id}")
+                        logger.debug("🟡 No next_batch found in sync response")
+                    
+                    # Try to process rooms if they exist
+                    try:
+                        # Check for rooms in different formats
+                        rooms_data = None
+                        
+                        if hasattr(sync_response, 'rooms'):
+                            rooms_data = sync_response.rooms
+                        elif isinstance(sync_response, dict) and 'rooms' in sync_response:
+                            rooms_data = sync_response['rooms']
+                        
+                        if rooms_data:
+                            # Process joined rooms
+                            join_rooms = None
+                            
+                            if hasattr(rooms_data, 'join'):
+                                join_rooms = rooms_data.join
+                            elif isinstance(rooms_data, dict) and 'join' in rooms_data:
+                                join_rooms = rooms_data['join']
+                            
+                            if join_rooms:
+                                for room_id, room_info in join_rooms.items():
+                                    logger.debug(f"🔵 Processing room: {room_id}")
+                                    
+                                    # Try to get timeline events
+                                    timeline_events = []
+                                    
+                                    if hasattr(room_info, 'timeline') and hasattr(room_info.timeline, 'events'):
+                                        timeline_events = room_info.timeline.events
+                                    elif isinstance(room_info, dict) and 'timeline' in room_info:
+                                        timeline = room_info['timeline']
+                                        if isinstance(timeline, dict) and 'events' in timeline:
+                                            timeline_events = timeline['events']
+                                    
+                                    if timeline_events:
+                                        await self._process_room_events(room_id, timeline_events)
+                    except Exception as room_error:
+                        logger.debug(f"🟡 Error processing rooms: {room_error}")
+                        
                 else:
-                    logger.warning("🟡 Empty sync response received")
+                    logger.debug("🟡 Empty sync response received")
 
                 # Wait before next sync
                 await asyncio.sleep(5)
