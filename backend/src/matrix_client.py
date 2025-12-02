@@ -108,17 +108,19 @@ class MatrixClient:
             self._initialized = False
             raise
 
-    async def request_keys_from_user(self, user_id: str):
-        """Request encryption keys from a user"""
+    async def request_keys_for_event(self, event: MegolmEvent):
+        """Request encryption keys for a specific encrypted event"""
         try:
-            logger.info(f"🔑 Requesting keys from {user_id}")
+            logger.info(f"🔑 Requesting keys for event from {event.sender}")
             
-            # Request keys for all rooms
-            await self.client.request_room_key(user_id=user_id)
-            logger.info(f"🟢 Key request sent to {user_id}")
+            # Request room key for this specific event
+            response = await self.client.request_room_key(event)
+            logger.info(f"🟢 Key request sent for event from {event.sender}")
+            return response
             
         except Exception as e:
             logger.error(f"🔴 Failed to request keys: {e}")
+            return None
 
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available"""
@@ -147,37 +149,57 @@ class MatrixClient:
         """Handle encrypted Megolm events"""
         try:
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
-            await matrix_client.request_keys_from_user("@rok862:staging-chat.adaire.dev")
-
+            
             # Check if we can decrypt
             if not self.client or not self.client.olm:
                 logger.warning("🟡 OLM not initialized, cannot decrypt")
                 return
 
-            # Try to decrypt
-            decrypted = await self.client.decrypt_event(event)
+            try:
+                # Try to decrypt
+                decrypted = await self.client.decrypt_event(event)
 
-            if decrypted and hasattr(decrypted, 'body'):
-                # Process as regular message
-                message_data = {
-                    "event_id": decrypted.event_id,
-                    "room_id": room.room_id,
-                    "sender": decrypted.sender,
-                    "body": decrypted.body,
-                    "message_type": "m.room.message",
-                    "timestamp": decrypted.server_timestamp,
-                    "room_name": room.display_name or room.room_id,
-                    "decrypted": True,
-                    "encrypted_event_id": event.event_id,
-                }
+                if decrypted and hasattr(decrypted, 'body'):
+                    # Successfully decrypted!
+                    message_data = {
+                        "event_id": decrypted.event_id,
+                        "room_id": room.room_id,
+                        "sender": decrypted.sender,
+                        "body": decrypted.body,
+                        "message_type": "m.room.message",
+                        "timestamp": decrypted.server_timestamp,
+                        "room_name": room.display_name or room.room_id,
+                        "decrypted": True,
+                        "encrypted_event_id": event.event_id,
+                    }
 
-                logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
+                    logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
 
-                # Call callbacks
-                for callback in self._message_callbacks:
-                    await callback(message_data)
-            else:
-                logger.warning(f"🟡 Could not decrypt event from {event.sender}")
+                    # Call callbacks
+                    for callback in self._message_callbacks:
+                        await callback(message_data)
+                else:
+                    logger.warning(f"🟡 Could not decrypt event from {event.sender}")
+                    
+                    # Request keys for this specific event
+                    logger.info(f"🔑 Requesting keys for event from {event.sender}")
+                    await self.request_keys_for_event(event)
+
+            except Exception as decrypt_error:
+                error_msg = str(decrypt_error)
+                logger.warning(f"🟡 Decryption failed: {error_msg}")
+                
+                # Check if it's a "no session" error
+                if "no session found" in error_msg or "undecryptable Megolm event" in error_msg:
+                    logger.info(f"🔑 No session found for {event.sender}, requesting keys...")
+                    
+                    # Extract device ID if available
+                    if hasattr(event, 'device_id'):
+                        device_id = event.device_id
+                        logger.info(f"   Device ID: {device_id}")
+                    
+                    # Request keys for this specific event
+                    await self.request_keys_for_event(event)
 
         except Exception as e:
             logger.error(f"🔴 Error handling encrypted event: {e}")
