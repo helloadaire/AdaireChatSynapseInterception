@@ -112,8 +112,9 @@ class MatrixClient:
     async def import_recovery_key(self, recovery_key: str):
         """Import a recovery key to decrypt historical messages"""
         try:
+            keys_path = os.path.join(self._store_path, 'element-keys.txt')
             # The recovery key is usually a base64-encoded string
-            await self.client.import_keys(,recovery_key)
+            await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
             logger.info("✅ Recovery key imported")
             
             # Also save it for future use
