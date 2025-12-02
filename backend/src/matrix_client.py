@@ -84,6 +84,63 @@ class MatrixClient:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
 
+    async def _import_recovery_key_if_exists(self):
+        """Import recovery key from settings if available"""
+        try:
+            if hasattr(settings, 'matrix_recovery_key') and settings.matrix_recovery_key:
+                recovery_key = settings.matrix_recovery_key.strip()
+                
+                logger.info("🔑 Importing recovery key...")
+                
+                # The recovery key is in 4S format (space-separated words)
+                # This is a passphrase, not a raw key
+                try:
+                    # Remove extra spaces and normalize
+                    normalized_key = " ".join(recovery_key.split())
+                    
+                    logger.info(f"Using recovery key (first few words): {normalized_key[:30]}...")
+                    
+                    # For matrix-nio, we need to use import_keys with the passphrase
+                    # The passphrase is the 4S key itself
+                    await self.client.import_keys(normalized_key)
+                    logger.info("✅ Recovery key imported successfully")
+                    
+                    # Save recovery key to file for backup
+                    crypto_store_path = os.path.join(self._store_path, "crypto")
+                    os.makedirs(crypto_store_path, exist_ok=True)
+                    
+                    recovery_key_path = os.path.join(crypto_store_path, "recovery_key.txt")
+                    with open(recovery_key_path, "w") as f:
+                        f.write(normalized_key)
+                    logger.info("💾 Recovery key saved to file")
+                    
+                    # After importing keys, we should load the store again
+                    try:
+                        await self.client.load_store()
+                        logger.info("✅ Store reloaded with recovery key")
+                    except Exception as load_error:
+                        logger.warning(f"⚠️ Could not reload store: {load_error}")
+                    
+                except Exception as import_error:
+                    logger.error(f"❌ Could not import recovery key: {import_error}")
+                    
+                    # Try alternative: maybe it's a base64 key without spaces
+                    try:
+                        logger.info("🔄 Trying alternative import method...")
+                        
+                        # Remove all spaces
+                        key_without_spaces = recovery_key.replace(" ", "")
+                        
+                        # Try as passphrase without spaces
+                        await self.client.import_keys(key_without_spaces)
+                        logger.info("✅ Recovery key imported (without spaces)")
+                    except Exception as alt_error:
+                        logger.error(f"❌ Alternative import also failed: {alt_error}")
+            else:
+                logger.info("ℹ️ No recovery key configured in settings")
+                
+        except Exception as e:
+            logger.error(f"❌ Error importing recovery key: {e}")
 
     async def import_recovery_key(self, recovery_key: str):
         """Import a recovery key to decrypt historical messages"""
