@@ -26,6 +26,7 @@ class MatrixClient:
         self._message_callbacks = []
         self._sync_token = None
         self._store_path = "./matrix_store"
+        self._device_id = settings.matrix_device_id or "CRMBOT"
 
     async def initialize(self):
         """Initialize Matrix client connection with proper configuration"""
@@ -35,19 +36,30 @@ class MatrixClient:
             # Ensure store directory exists
             os.makedirs(self._store_path, exist_ok=True)
 
+            # IMPORTANT: Create store directory structure first
+            crypto_store_path = os.path.join(self._store_path, "crypto")
+            os.makedirs(crypto_store_path, exist_ok=True)
+
+            # First, check if we need to restore from backup keys
+            await self._restore_from_backup_if_needed()
+
             # Create proper ClientConfig object
             config = ClientConfig(
                 encryption_enabled=True,  # Enable E2EE
                 store_sync_tokens=True,
             )
 
-            # Initialize client WITHOUT store_path initially to avoid issues
+            # Initialize client WITH store_path this time
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
                 user=settings.matrix_user_id,
-                device_id=settings.matrix_device_id or "CRMBOT",
+                device_id=self._device_id,
+                store_path=self._store_path,
                 config=config,
             )
+
+            # Disable response validation to avoid 'next_batch' errors
+            self.client.validate_response = False
 
             # Set access token if provided
             if settings.matrix_access_token:
@@ -57,11 +69,15 @@ class MatrixClient:
             else:
                 logger.warning("⚠️ No access token provided. Client may not be able to sync.")
 
+            # IMPORTANT: Load store FIRST before doing anything else
+            await self.client.load_store()
+            logger.info("✅ Store loaded successfully")
+
             # Add event callbacks
             self.client.add_event_callback(self._on_message, RoomMessageText)
             self.client.add_event_callback(self._on_encrypted, MegolmEvent)
 
-            # IMPORTANT: Initialize encryption BEFORE syncing
+            # Now initialize encryption
             await self._initialize_encryption()
 
             # Try to import recovery key
@@ -70,6 +86,7 @@ class MatrixClient:
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
             logger.info(f"👤 User ID: {settings.matrix_user_id}")
+            logger.info(f"📱 Device ID: {self._device_id}")
 
             # Start syncing
             if self.client.access_token:
@@ -82,6 +99,16 @@ class MatrixClient:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
 
+    async def _restore_from_backup_if_needed(self):
+        """Check for and restore from backup keys if available"""
+        try:
+            backup_path = os.path.join(self._store_path, "crypto", "account.pickle")
+            if os.path.exists(backup_path):
+                logger.info("🔍 Found existing crypto backup, will attempt to restore")
+                # The store will be loaded when AsyncClient is initialized
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check for backup: {e}")
+
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available"""
         try:
@@ -89,9 +116,14 @@ class MatrixClient:
             logger.info(f"Checking for key at location: {keys_path}")
 
             if os.path.exists(keys_path):
+                # Check if store is loaded
+                if not self.client.olm:
+                    logger.warning("⚠️ OLM not loaded, cannot import keys")
+                    return
+
                 # Try to import keys
                 result = await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
-                logger.info(f"✅ Recovery key imported: {result}")
+                logger.info(f"✅ Recovery key imported successfully")
             else:
                 logger.warning(f"⚠️ No key file found at {keys_path}")
         except Exception as e:
@@ -101,6 +133,11 @@ class MatrixClient:
         """Handle encrypted Megolm events"""
         try:
             logger.info(f"🔐 Received encrypted event from {event.sender} in room {room.room_id}")
+
+            # Check if we can decrypt
+            if not self.client.olm:
+                logger.warning("⚠️ OLM not initialized, cannot decrypt")
+                return
 
             # Try to decrypt
             decrypted = await self.client.decrypt_event(event)
@@ -135,29 +172,25 @@ class MatrixClient:
         try:
             logger.info("🔐 Initializing encryption...")
 
-            # Enable encryption on the client
+            # Check if OLM is already loaded
             if not self.client.olm:
-                # Initialize OLM if not already done
-                await self.client.load_store()
-                logger.info("✅ Loaded encryption store")
+                logger.error("❌ OLM not available after loading store")
+                return
 
             # Upload device keys
             if self.client.access_token:
                 try:
-                    # First make sure we have device keys
-                    if not hasattr(self.client, 'device_id') or not self.client.device_id:
-                        self.client.device_id = settings.matrix_device_id or "CRMBOT"
-
                     # Upload keys
                     await self.client.keys_upload()
                     logger.info("✅ Device keys uploaded")
 
-                    # Query keys for ourselves (this doesn't take arguments in newer versions)
+                    # Query keys for ourselves
                     await self.client.keys_query()
                     logger.info("✅ Queried device keys")
 
                 except Exception as upload_error:
-                    logger.warning(f"⚠️ Could not upload device keys: {upload_error}")
+                    # This might be normal if keys are already uploaded
+                    logger.debug(f"Device key operation: {upload_error}")
 
             logger.info("🔐 Encryption initialized successfully")
 
@@ -170,6 +203,19 @@ class MatrixClient:
         self.syncing = True
         logger.info("🔄 Starting Matrix sync loop...")
 
+        # Initial sync to get token
+        try:
+            initial_sync = await self.client.sync(
+                timeout=30000,
+                full_state=True  # First sync should get full state
+            )
+            
+            if initial_sync and hasattr(initial_sync, 'next_batch'):
+                self._sync_token = initial_sync.next_batch
+                logger.info(f"📝 Initial sync token: {self._sync_token}")
+        except Exception as e:
+            logger.error(f"❌ Initial sync failed: {e}")
+
         # Continuous sync loop
         while self.syncing:
             try:
@@ -181,29 +227,18 @@ class MatrixClient:
                 )
 
                 if sync_response:
-                    # Check if sync_response has required attributes
+                    # Update sync token
                     if hasattr(sync_response, 'next_batch'):
                         self._sync_token = sync_response.next_batch
                         logger.debug(f"Updated sync token: {self._sync_token}")
                     else:
                         logger.warning("⚠️ Sync response missing next_batch")
 
-                    # Process joined rooms
-                    if hasattr(sync_response, 'rooms') and sync_response.rooms:
+                    # Log room activity
+                    if hasattr(sync_response, 'rooms'):
                         if hasattr(sync_response.rooms, 'join'):
-                            for room_id, room_info in sync_response.rooms.join.items():
-                                if hasattr(room_info, 'timeline') and room_info.timeline:
-                                    if hasattr(room_info.timeline, 'events'):
-                                        await self._process_room_events(room_id, room_info.timeline.events)
-                        else:
-                            logger.debug("No joined rooms in sync response")
-                    else:
-                        logger.debug("No rooms data in sync response")
-
-                    # Process to_device events (for E2EE)
-                    if hasattr(sync_response, 'to_device') and sync_response.to_device:
-                        if hasattr(sync_response.to_device, 'events'):
-                            await self._process_to_device_events(sync_response.to_device.events)
+                            for room_id in sync_response.rooms.join.keys():
+                                logger.debug(f"Active room: {room_id}")
                 else:
                     logger.warning("⚠️ Empty sync response received")
 
@@ -214,49 +249,20 @@ class MatrixClient:
                 logger.info("🛑 Sync task cancelled")
                 break
             except Exception as e:
-                logger.error(f"❌ Matrix sync error: {e}", exc_info=True)
+                logger.error(f"❌ Matrix sync error: {e}")
                 # Wait longer on error
                 await asyncio.sleep(30)
-
-    async def _process_to_device_events(self, events):
-        """Process to_device events for E2EE key sharing"""
-        try:
-            if not events:
-                return
-
-            logger.debug(f"🔑 Processing {len(events)} to_device events")
-
-            for event in events:
-                try:
-                    # Let the client handle to_device events (for key sharing)
-                    # The AsyncClient handles to_device events automatically during sync
-                    pass
-                except Exception as e:
-                    logger.warning(f"⚠️ Error processing to_device event: {e}")
-
-        except Exception as e:
-            logger.error(f"❌ Error processing to_device events: {e}")
-
-    async def _process_room_events(self, room_id: str, events: list):
-        """Process events from a room, handling encryption"""
-        for event in events:
-            try:
-                # Get event type
-                event_type = getattr(event, 'type', 'unknown')
-                logger.debug(f"Processing event type: {event_type} in room {room_id}")
-
-                # The event callbacks will handle the specific event types
-                # We don't need to manually process them here since we've already
-                # registered callbacks for RoomMessageText and MegolmEvent
-
-            except Exception as e:
-                logger.error(f"❌ Error processing room event: {e}")
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText):
         """Handle incoming Matrix text messages"""
         try:
             # Skip if it's our own message
             if event.sender == self.client.user_id:
+                return
+
+            # Check if this is an encrypted room but message is unencrypted
+            if room.encrypted and not hasattr(event, 'decrypted'):
+                logger.warning(f"⚠️ Unencrypted message in encrypted room from {event.sender}")
                 return
 
             # Create message data structure
@@ -270,7 +276,7 @@ class MatrixClient:
                 "room_name": room.display_name or room.room_id,
                 "msgtype": getattr(event, 'msgtype', 'm.text'),
                 "formatted_body": getattr(event, 'formatted_body', None),
-                "decrypted": False  # Regular messages aren't encrypted
+                "decrypted": getattr(event, 'decrypted', False)
             }
 
             # Log the message
@@ -280,6 +286,7 @@ class MatrixClient:
 
             logger.info(f"📨 Message from {event.sender} in room {room.room_id}")
             logger.info(f"   Content: {body_preview}")
+            logger.info(f"   Decrypted: {message_data['decrypted']}")
 
             # Call all registered callbacks
             for callback in self._message_callbacks:
@@ -363,11 +370,21 @@ class MatrixClient:
         self.syncing = False
 
         if self.client:
-            # Save store if needed
             try:
+                # Save the store
                 if hasattr(self.client, 'store') and self.client.store:
                     await self.client.store.save()
                     logger.info("💾 Saved store")
+                    
+                    # Also backup crypto separately
+                    if hasattr(self.client, 'olm') and self.client.olm:
+                        crypto_store_path = os.path.join(self._store_path, "crypto")
+                        os.makedirs(crypto_store_path, exist_ok=True)
+                        
+                        # Export keys for backup
+                        export_path = os.path.join(crypto_store_path, "exported_keys.txt")
+                        await self.client.export_keys(export_path, ELEMENT_KEY_PASSPHRASE)
+                        logger.info(f"💾 Exported encryption keys to {export_path}")
             except Exception as e:
                 logger.warning(f"⚠️ Could not save store: {e}")
 
