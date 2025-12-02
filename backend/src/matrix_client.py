@@ -133,40 +133,73 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Error handling encrypted event: {e}")
 
+    async def _process_to_device_events(self, events):
+        """Process to_device events for E2EE key sharing"""
+        try:
+            if not events:
+                return
+                
+            logger.info(f"🔑 Processing {len(events)} to_device events")
+            
+            for event in events:
+                try:
+                    # Let the client handle to_device events (for key sharing)
+                    await self.client.handle_to_device_event(event)
+                except Exception as e:
+                    logger.warning(f"⚠️ Error processing to_device event: {e}")
+                    
+        except Exception as e:
+            logger.error(f"❌ Error processing to_device events: {e}")
+    
+    
     async def _initialize_encryption(self):
         """Initialize E2EE encryption store"""
         try:
-            # Check if crypto store exists
-            crypto_store_path = os.path.join(self._store_path, "crypto")
-            pickle_path = os.path.join(crypto_store_path, "account.pickle")
-            
-            if os.path.exists(pickle_path):
-                # Load existing crypto store
-                async with aiofiles.open(pickle_path, "rb") as f:
-                    pickle_data = await f.read()
-                    await self.client.load_account(pickle_data)
-                logger.info("✅ Loaded existing encryption keys")
-            else:
-                # Create new crypto store
-                logger.info("🔑 Creating new encryption keys...")
-                os.makedirs(crypto_store_path, exist_ok=True)
+            # Try to load existing store first
+            try:
+                # Load the store - this will load or create the crypto store
+                await self.client.load_store()
+                logger.info("✅ Loaded encryption store")
                 
-                # Initialize the client's crypto store
-                await self.client.receive_response({
-                    "type": "m.login",
-                    "user_id": self.client.user_id,
-                    "access_token": self.client.access_token
-                })
+                # Try to upload keys if we have access token
+                if self.client.access_token and hasattr(self.client, 'olm'):
+                    try:
+                        await self.client.keys_upload()
+                        logger.info("✅ Device keys uploaded")
+                    except Exception as upload_error:
+                        logger.warning(f"⚠️ Could not upload device keys: {upload_error}")
                 
-                # Generate and upload device keys
-                await self.client.keys_upload()
-                logger.info("✅ Generated new encryption keys")
+            except Exception as load_error:
+                logger.warning(f"⚠️ Could not load store: {load_error}")
+                # Create new store
+                await self._create_new_crypto_store()
                 
             logger.info("🔐 Encryption initialized successfully")
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize encryption: {e}")
             # Don't raise - we might still be able to operate without full E2EE
+
+    async def _create_new_crypto_store(self):
+        """Create a new crypto store"""
+        try:
+            logger.info("🔑 Creating new encryption keys...")
+            
+            # Initialize the crypto module
+            if hasattr(self.client, 'olm'):
+                # Upload initial device keys
+                await self.client.keys_upload()
+                logger.info("✅ Created new encryption keys")
+                
+                # If we have access to the homeserver, query our own keys
+                if self.client.access_token:
+                    await self.client.keys_query({self.client.user_id: []})
+                    logger.info("✅ Queries device keys")
+            else:
+                logger.warning("⚠️ OLM not available")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to create crypto store: {e}")
     
     
     async def _handle_encrypted_event(self, room_id: str, event):
@@ -317,6 +350,27 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Error handling decrypted message: {e}")
     
+    async def login_and_initialize(self):
+        """Login and initialize encryption"""
+        try:
+            # First ensure we're logged in
+            if not self.client.access_token:
+                logger.error("❌ No access token available")
+                return False
+                
+            # Now initialize encryption
+            await self._initialize_encryption()
+            
+            # Start syncing
+            asyncio.create_task(self._start_syncing())
+            
+            logger.info("✅ Logged in and encryption initialized")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to login and initialize: {e}")
+            return False
+    
     async def _start_syncing(self):
         """Start syncing with Matrix server"""
         self.syncing = True
@@ -332,9 +386,12 @@ class MatrixClient:
                     full_state=False  # Don't request full state every time
                 )
                 
-                print(sync_response)
-                
-                # Check if sync_response is an error
+                # Check if sync_response is None or an error
+                if sync_response is None:
+                    logger.warning("⚠️ Empty sync response received")
+                    await asyncio.sleep(30)
+                    continue
+                    
                 if hasattr(sync_response, 'error'):
                     logger.error(f"❌ Sync error: {sync_response.error}")
                     await asyncio.sleep(30)
