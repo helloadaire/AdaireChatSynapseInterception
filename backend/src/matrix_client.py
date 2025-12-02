@@ -219,20 +219,26 @@ class MatrixClient:
     async def _initialize_encryption(self):
         """Initialize E2EE encryption store"""
         try:
+            # Wait a bit to ensure client is ready
+            await asyncio.sleep(0.5)
+            
             # Try to load existing store first
             try:
-                # Load the store - this will load or create the crypto store
-                await self.client.load_store()
-                logger.info("✅ Loaded encryption store")
-                
-                # Try to upload keys if we have access token
-                if self.client.access_token and hasattr(self.client, 'olm'):
-                    try:
-                        await self.client.keys_upload()
-                        logger.info("✅ Device keys uploaded")
-                    except Exception as upload_error:
-                        logger.warning(f"⚠️ Could not upload device keys: {upload_error}")
-                
+                if self.client:
+                    # Load the store - this will load or create the crypto store
+                    await self.client.load_store()
+                    logger.info("✅ Loaded encryption store")
+                    
+                    # Try to upload keys if we have access token
+                    if self.client.access_token and hasattr(self.client, 'olm'):
+                        try:
+                            await self.client.keys_upload()
+                            logger.info("✅ Device keys uploaded")
+                        except Exception as upload_error:
+                            logger.warning(f"⚠️ Could not upload device keys: {upload_error}")
+                else:
+                    logger.warning("⚠️ Client not initialized yet")
+                    
             except Exception as load_error:
                 logger.warning(f"⚠️ Could not load store: {load_error}")
                 # Create new store
@@ -252,22 +258,15 @@ class MatrixClient:
             # Initialize the crypto module
             if hasattr(self.client, 'olm'):
                 # Upload initial device keys
-                await self.client.keys_upload()
-                logger.info("✅ Created new encryption keys")
-                
-                # If we have access to the homeserver, query our own keys
-                if self.client.access_token:
-                    # Fix: keys_query doesn't take arguments in newer versions
-                    try:
-                        await self.client.keys_query()
-                        logger.info("✅ Queried device keys")
-                    except TypeError:
-                        # Older API version
-                        await self.client.keys_query({self.client.user_id: []})
-                        logger.info("✅ Queried device keys (old API)")
+                try:
+                    await self.client.keys_upload()
+                    logger.info("✅ Created new encryption keys")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not upload keys: {e}")
+                    # This might be OK - keys might already exist
             else:
                 logger.warning("⚠️ OLM not available")
-                
+                    
         except Exception as e:
             logger.error(f"❌ Failed to create crypto store: {e}")
             
@@ -456,31 +455,63 @@ class MatrixClient:
                     full_state=False  # Don't request full state every time
                 )
                 
-                # Check if sync_response is None or an error
+                # Check if sync_response is None
                 if sync_response is None:
                     logger.warning("⚠️ Empty sync response received")
                     await asyncio.sleep(30)
                     continue
-                    
-                if hasattr(sync_response, 'error'):
-                    logger.error(f"❌ Sync error: {sync_response.error}")
+                
+                await self._debug_sync_response(sync_response)
+                
+                # Check if it's an error response
+                if isinstance(sync_response, dict) and 'error' in sync_response:
+                    logger.error(f"❌ Sync error: {sync_response.get('error')}")
                     await asyncio.sleep(30)
                     continue
                     
-                if hasattr(sync_response, 'rooms') and hasattr(sync_response.rooms, 'join'):
-                    # Update sync token
-                    if hasattr(sync_response, 'next_batch'):
+                # Check if it has the sync_error attribute
+                if hasattr(sync_response, 'sync_error'):
+                    logger.error(f"❌ Sync error: {sync_response.sync_error}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Try to process the sync response
+                try:
+                    # Update sync token if available
+                    if hasattr(sync_response, 'next_batch') and sync_response.next_batch:
                         self._sync_token = sync_response.next_batch
+                        logger.debug(f"🔁 Updated sync token: {self._sync_token[:20]}...")
                     
-                    # Process joined rooms
-                    for room_id, room_info in sync_response.rooms.join.items():
-                        await self._process_room_events(room_id, room_info.timeline.events)
+                    # Check for rooms
+                    if hasattr(sync_response, 'rooms'):
+                        # Process joined rooms
+                        if hasattr(sync_response.rooms, 'join'):
+                            for room_id, room_info in sync_response.rooms.join.items():
+                                logger.info(f"🔄 Processing room: {room_id}")
+                                if hasattr(room_info, 'timeline') and hasattr(room_info.timeline, 'events'):
+                                    await self._process_room_events(room_id, room_info.timeline.events)
+                        
+                        # Also check for invited rooms
+                        if hasattr(sync_response.rooms, 'invite'):
+                            for room_id, room_info in sync_response.rooms.invite.items():
+                                logger.info(f"📩 Invited to room: {room_id}")
+                        
+                        # Also check for left rooms  
+                        if hasattr(sync_response.rooms, 'leave'):
+                            for room_id, room_info in sync_response.rooms.leave.items():
+                                logger.info(f"🚪 Left room: {room_id}")
                     
                     # Process to_device events (for E2EE)
                     if hasattr(sync_response, 'to_device'):
                         await self._process_to_device_events(sync_response.to_device.events)
-                else:
-                    logger.warning("⚠️ Sync response missing rooms data")
+                    
+                    # Log sync completion
+                    logger.debug("✅ Sync cycle completed successfully")
+                    
+                except AttributeError as attr_error:
+                    logger.error(f"❌ Sync response structure error: {attr_error}")
+                    logger.debug(f"Sync response type: {type(sync_response)}")
+                    logger.debug(f"Sync response: {sync_response}")
                 
                 # Wait before next sync
                 await asyncio.sleep(10)
@@ -492,6 +523,30 @@ class MatrixClient:
                 logger.error(f"❌ Matrix sync error: {e}", exc_info=True)
                 # Wait longer on error
                 await asyncio.sleep(30)
+                
+    async def _debug_sync_response(self, sync_response):
+        """Debug helper to understand sync response structure"""
+        if sync_response is None:
+            logger.debug("Sync response is None")
+            return
+            
+        logger.debug(f"Sync response type: {type(sync_response)}")
+        
+        # Check attributes
+        attrs = dir(sync_response)
+        logger.debug(f"Sync response attributes: {attrs}")
+        
+        # Check for specific important attributes
+        important_attrs = ['rooms', 'next_batch', 'to_device', 'presence', 'account_data']
+        for attr in important_attrs:
+            if hasattr(sync_response, attr):
+                logger.debug(f"Has {attr}: {getattr(sync_response, attr)}")
+            else:
+                logger.debug(f"Missing {attr}")
+        
+        # If it's a dict-like object
+        if isinstance(sync_response, dict):
+            logger.debug(f"Sync response keys: {sync_response.keys()}")
     
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText):
         """Handle incoming Matrix text messages"""
