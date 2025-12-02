@@ -102,7 +102,7 @@ class MatrixClient:
                     
                     # For matrix-nio, we need to use import_keys with the passphrase
                     # The passphrase is the 4S key itself
-                    await self.client.import_keys(normalized_key)
+                    await self.client.import_keys(normalized_key, normalized_key)
                     logger.info("✅ Recovery key imported successfully")
                     
                     # Save recovery key to file for backup
