@@ -4,7 +4,7 @@ from typing import Optional, Callable, Dict, Any
 import asyncio
 import json
 import logging
-from datetime import datetime
+from nio import MegolmEvent
 from nio.crypto import ENCRYPTION_ENABLED
 import aiofiles
 import pickle
@@ -47,6 +47,8 @@ class MatrixClient:
                 config=config,
             )
             
+            self.client.add_event_callback(self._on_encrypted, MegolmEvent)
+            
             # Disable response validation to avoid 'next_batch' errors
             self.client.validate_response = False
             
@@ -78,6 +80,58 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
+
+    async def import_recovery_key(self, recovery_key: str):
+        """Import a recovery key to decrypt historical messages"""
+        try:
+            # The recovery key is usually a base64-encoded string
+            await self.client.import_keys(recovery_key)
+            logger.info("✅ Recovery key imported")
+            
+            # Also save it for future use
+            crypto_store_path = os.path.join(self._store_path, "crypto")
+            os.makedirs(crypto_store_path, exist_ok=True)
+            
+            recovery_key_path = os.path.join(crypto_store_path, "recovery_key.txt")
+            async with aiofiles.open(recovery_key_path, "w") as f:
+                await f.write(recovery_key)
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to import recovery key: {e}")
+            raise
+    
+    async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
+        """Handle encrypted Megolm events"""
+        try:
+            logger.info(f"🔐 Received encrypted event from {event.sender} in room {room.room_id}")
+            
+            # Try to decrypt
+            decrypted = await self.client.decrypt_event(event)
+            
+            if decrypted and hasattr(decrypted, 'body'):
+                # Process as regular message
+                message_data = {
+                    "event_id": decrypted.event_id,
+                    "room_id": room.room_id,
+                    "sender": decrypted.sender,
+                    "body": decrypted.body,
+                    "message_type": "m.room.message",
+                    "timestamp": decrypted.server_timestamp,
+                    "room_name": room.display_name or room.room_id,
+                    "decrypted": True,
+                    "encrypted_event_id": event.event_id,
+                }
+                
+                logger.info(f"🔓 Decrypted message: {message_data['body'][:100]}")
+                
+                # Call callbacks
+                for callback in self._message_callbacks:
+                    await callback(message_data)
+            else:
+                logger.warning(f"⚠️ Could not decrypt event from {event.sender}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling encrypted event: {e}")
 
     async def _initialize_encryption(self):
         """Initialize E2EE encryption store"""
@@ -417,10 +471,24 @@ class MatrixClient:
             return []
     
     async def close(self):
-        """Close Matrix client connection"""
+        """Close Matrix client connection and save encryption keys"""
         logger.info("🛑 Closing Matrix client...")
         self.syncing = False
+        
         if self.client:
+            # Save encryption keys if available
+            try:
+                if hasattr(self.client, 'save_account'):
+                    account_data = await self.client.save_account()
+                    crypto_store_path = os.path.join(self._store_path, "crypto")
+                    os.makedirs(crypto_store_path, exist_ok=True)
+                    
+                    async with aiofiles.open(os.path.join(crypto_store_path, "account.pickle"), "wb") as f:
+                        await f.write(account_data)
+                    logger.info("💾 Saved encryption keys")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not save encryption keys: {e}")
+            
             await self.client.close()
         logger.info("✅ Matrix client closed")
 
