@@ -5,6 +5,9 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+from nio.crypto import ENCRYPTION_ENABLED
+import aiofiles
+import pickle
 import os
 
 from config.settings import settings
@@ -20,7 +23,8 @@ class MatrixClient:
         self._message_callbacks = []
         self._sync_token = None
         self._store_path = "./matrix_store"
-        
+    
+
     async def initialize(self):
         """Initialize Matrix client connection with proper configuration"""
         try:
@@ -29,16 +33,12 @@ class MatrixClient:
             # Ensure store directory exists
             os.makedirs(self._store_path, exist_ok=True)
             
-            # Create proper ClientConfig object (NOT a dict)
+            # Create proper ClientConfig object
             config = ClientConfig(
-                # store_path="./matrix_store",
-                encryption_enabled=True,  # Disable E2EE for simplicity
+                encryption_enabled=True,  # Enable E2EE
                 store_sync_tokens=True,
             )
             
-            self._store_path = "./matrix_store"
-            crypto_store_path = os.path.join(self._store_path, "crypto")
-
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
                 user=settings.matrix_user_id,
@@ -46,13 +46,6 @@ class MatrixClient:
                 store_path=self._store_path,
                 config=config,
             )
-            
-            # self.client = AsyncClient(
-            #     homeserver=settings.matrix_homeserver_url,
-            #     user=settings.matrix_user_id,
-            #     device_id=settings.matrix_device_id or "CRMBOT",
-            #     config=config
-            # )
             
             # Disable response validation to avoid 'next_batch' errors
             self.client.validate_response = False
@@ -65,22 +58,16 @@ class MatrixClient:
             else:
                 logger.warning("⚠️ No access token provided. Client may not be able to sync.")
             
-            # Add event callback for text messages only
+            # Add event callbacks
             self.client.add_event_callback(self._on_message, RoomMessageText)
+            
+            # IMPORTANT: Initialize encryption BEFORE syncing
+            await self._initialize_encryption()
             
             # Log configuration
             logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
             logger.info(f"👤 User ID: {settings.matrix_user_id}")
             
-            
-            crypto_store_path = os.path.join(self._store_path, "CRYPTO_STORE")
-            if os.path.exists(crypto_store_path):
-                try:
-                    await self.client.load_store()
-                    logger.info("✅ Loaded encryption store")
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not load encryption store: {e}")
-                    
             # Start syncing
             if self.client.access_token:
                 asyncio.create_task(self._start_syncing())
@@ -88,26 +75,44 @@ class MatrixClient:
             
             logger.info("✅ Matrix client initialized with E2EE support")
             
-            # Simple connection test
-            try:
-                # Just log the configuration
-                logger.info(f"📡 Configured for homeserver: {settings.matrix_homeserver_url}")
-                logger.info(f"👤 User ID: {settings.matrix_user_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Connection test warning: {e}")
-            
-            # Start syncing in background if we have credentials
-            if self.client.access_token:
-                asyncio.create_task(self._start_syncing())
-                logger.info("🔄 Starting sync process...")
-            else:
-                logger.warning("⏸️ No access token. Syncing disabled.")
-            
-            logger.info("✅ Matrix client initialized successfully")
-            
         except Exception as e:
             logger.error(f"❌ Failed to initialize Matrix client: {e}", exc_info=True)
             raise
+
+    async def _initialize_encryption(self):
+        """Initialize E2EE encryption store"""
+        try:
+            # Check if crypto store exists
+            crypto_store_path = os.path.join(self._store_path, "crypto")
+            pickle_path = os.path.join(crypto_store_path, "account.pickle")
+            
+            if os.path.exists(pickle_path):
+                # Load existing crypto store
+                async with aiofiles.open(pickle_path, "rb") as f:
+                    pickle_data = await f.read()
+                    await self.client.load_account(pickle_data)
+                logger.info("✅ Loaded existing encryption keys")
+            else:
+                # Create new crypto store
+                logger.info("🔑 Creating new encryption keys...")
+                os.makedirs(crypto_store_path, exist_ok=True)
+                
+                # Initialize the client's crypto store
+                await self.client.receive_response({
+                    "type": "m.login",
+                    "user_id": self.client.user_id,
+                    "access_token": self.client.access_token
+                })
+                
+                # Generate and upload device keys
+                await self.client.keys_upload()
+                logger.info("✅ Generated new encryption keys")
+                
+            logger.info("🔐 Encryption initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize encryption: {e}")
+            # Don't raise - we might still be able to operate without full E2EE
     
     
     async def _handle_encrypted_event(self, room_id: str, event):
