@@ -149,6 +149,8 @@ class MatrixClient:
                     logger.warning(f"⚠️ Error processing to_device event: {e}")
                     
         except Exception as e:
+            logger.error(f"❌ Error processing to_device events: {e}")
+    
     
     async def _initialize_encryption(self):
         """Initialize E2EE encryption store"""
@@ -191,15 +193,21 @@ class MatrixClient:
                 
                 # If we have access to the homeserver, query our own keys
                 if self.client.access_token:
-                    await self.client.keys_query({self.client.user_id: []})
-                    logger.info("✅ Queries device keys")
+                    # Fix: keys_query doesn't take arguments in newer versions
+                    try:
+                        await self.client.keys_query()
+                        logger.info("✅ Queried device keys")
+                    except TypeError:
+                        # Older API version
+                        await self.client.keys_query({self.client.user_id: []})
+                        logger.info("✅ Queried device keys (old API)")
             else:
                 logger.warning("⚠️ OLM not available")
                 
         except Exception as e:
             logger.error(f"❌ Failed to create crypto store: {e}")
-    
-    
+            
+            
     async def _handle_encrypted_event(self, room_id: str, event):
         """Handle encrypted MegolmEvent"""
         try:
