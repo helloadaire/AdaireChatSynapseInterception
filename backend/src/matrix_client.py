@@ -32,16 +32,27 @@ class MatrixClient:
             # Create proper ClientConfig object (NOT a dict)
             config = ClientConfig(
                 # store_path="./matrix_store",
-                encryption_enabled=False,  # Disable E2EE for simplicity
+                encryption_enabled=True,  # Disable E2EE for simplicity
                 store_sync_tokens=True,
             )
             
+            self._store_path = "./matrix_store"
+            crypto_store_path = os.path.join(self._store_path, "crypto")
+
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
                 user=settings.matrix_user_id,
                 device_id=settings.matrix_device_id or "CRMBOT",
-                config=config
+                store_path=self._store_path,
+                config=config,
             )
+            
+            # self.client = AsyncClient(
+            #     homeserver=settings.matrix_homeserver_url,
+            #     user=settings.matrix_user_id,
+            #     device_id=settings.matrix_device_id or "CRMBOT",
+            #     config=config
+            # )
             
             # Disable response validation to avoid 'next_batch' errors
             self.client.validate_response = False
