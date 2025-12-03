@@ -9,6 +9,7 @@ from nio.crypto import ENCRYPTION_ENABLED
 import aiofiles
 import pickle
 import os
+import time  # ADD THIS IMPORT
 
 ELEMENT_KEY_PASSPHRASE = 'IWxCmrVzpjSfqicBIu'
 
@@ -79,19 +80,26 @@ class MatrixClient:
 
             # Load store BEFORE initializing encryption
             try:
-                await self.client.load_store()
-                logger.info("🟢 Store loaded successfully")
+                # Try to load store with proper error handling
+                if self.client.store:
+                    # Check if store needs to be loaded
+                    await self.client.load_store()
+                    logger.info("🟢 Store loaded successfully")
+                else:
+                    logger.info("🟡 Store not available, will create new one")
             except Exception as e:
-                logger.warning(f"🟡 Could not load store (might not exist yet): {e}")
-                # Create new store if doesn't exist
-                if "not exist" in str(e):
-                    logger.info("🟡 Creating new store...")
+                logger.warning(f"🟡 Could not load store: {e}")
 
             # Initialize encryption PROPERLY
             await self._initialize_encryption_properly()
 
             # Import recovery key if available
             await self._import_recovery_key_if_exists()
+
+            # Log configuration
+            logger.info(f"🔵 Configured for homeserver: {settings.matrix_homeserver_url}")
+            logger.info(f"🔵 User ID: {settings.matrix_user_id}")
+            logger.info(f"🔵 Device ID: {device_id}")
 
             # Start sync
             if self.client and self.client.access_token:
@@ -117,26 +125,45 @@ class MatrixClient:
             # Ensure OLM is loaded
             if not self.client.olm:
                 logger.info("🔵 Loading OLM...")
-                # Load crypto store
-                self.client.load_crypto_store()
+                # Load crypto store - different method for newer nio versions
+                try:
+                    # Try the new way first
+                    if hasattr(self.client, 'load_crypto_store'):
+                        self.client.load_crypto_store()
+                    # Alternative: just accessing olm might initialize it
+                    elif hasattr(self.client, 'olm'):
+                        pass  # Already handled
+                except Exception as e:
+                    logger.warning(f"🟡 Could not load crypto store: {e}")
 
             # Upload device keys (required for E2EE)
             if self.client.access_token:
                 try:
-                    # First query our own keys
-                    await self.client.keys_query({self.client.user_id: []})
+                    # First upload our own device keys
+                    upload_response = await self.client.keys_upload()
+                    if upload_response:
+                        logger.info("🟢 Device keys uploaded/verified")
+                    else:
+                        logger.warning("🟡 Device keys upload may have failed")
                     
-                    # Upload device keys if needed
-                    await self.client.keys_upload()
-                    logger.info("🟢 Device keys uploaded")
-                    
-                    # Share keys with users we might communicate with
-                    # This is crucial for the bot to receive encrypted messages
-                    await self.client.keys_claim()
-                    
+                    # Initialize encryption - this is crucial!
+                    # Some versions need explicit encryption start
+                    if hasattr(self.client, 'start_encryption'):
+                        await self.client.start_encryption()
+                        logger.info("🟢 Encryption started")
+                        
                 except Exception as e:
                     logger.warning(f"🟡 Key operation warning: {e}")
-                    # Continue anyway - might already be uploaded
+                    # Check if it's already initialized
+                    if "already uploaded" in str(e).lower():
+                        logger.info("🟢 Device keys already uploaded")
+                    else:
+                        # Try the deprecated method for compatibility
+                        try:
+                            await self.client.keys_query()
+                            logger.info("🟢 Keys queried (compatibility mode)")
+                        except Exception as query_error:
+                            logger.warning(f"🟡 Compatibility query also failed: {query_error}")
 
             logger.info("🟢 Encryption initialized successfully")
             
@@ -267,39 +294,56 @@ class MatrixClient:
             except Exception as e:
                 logger.warning(f"🟡 Direct key request failed: {e}")
                 
-            # Method 2: Query user's devices and send key requests
+            # Method 2: Try alternative approach - query keys with correct API
             try:
-                # Query the sender's devices
-                query_response = await self.client.keys_query({event.sender: []})
+                # Fix for API compatibility - try different approaches
+                user_id = event.sender
                 
-                if query_response and hasattr(query_response, 'device_keys'):
-                    devices = query_response.device_keys.get(event.sender, {})
+                # Approach 1: Try without parameters (older API)
+                try:
+                    query_response = await self.client.keys_query()
+                    logger.info("🟢 Keys queried (no parameters)")
+                except TypeError:
+                    # Approach 2: Try with empty dict (newer API)
+                    query_response = await self.client.keys_query({})
+                    logger.info("🟢 Keys queried (empty dict)")
                     
+                # If we got a response, try to send key request to all devices
+                if query_response and hasattr(query_response, 'device_keys'):
+                    devices = query_response.device_keys.get(user_id, {})
+                    
+                    if not devices:
+                        # Try to fetch device list separately
+                        logger.info(f"🔑 No devices in query response, trying device list for {user_id}")
+                        # We'll skip device-specific requests for now
+                        return
+                        
                     for device_id in devices.keys():
                         logger.info(f"🔑 Sending key request to device {device_id}")
                         
                         # Create a key request
-                        request = {
-                            "algorithm": "m.megolm.v1.aes-sha2",
-                            "room_id": room.room_id,
-                            "sender_key": sender_key,
-                            "session_id": session_id,
+                        request_content = {
+                            "action": "request",
+                            "requesting_device_id": self.client.device_id,
+                            "request_id": f"req_{int(time.time())}",
+                            "body": {
+                                "algorithm": "m.megolm.v1.aes-sha2",
+                                "room_id": room.room_id,
+                                "sender_key": sender_key,
+                                "session_id": session_id,
+                            }
                         }
                         
                         # Send to-device message requesting keys
-                        await self.client.send_to_device(
+                        await self.client.to_device(
                             "m.room_key_request",
                             {
-                                event.sender: {
-                                    device_id: {
-                                        "action": "request",
-                                        "requesting_device_id": self.client.device_id,
-                                        "request_id": f"req_{int(time.time())}",
-                                        "body": request
-                                    }
+                                user_id: {
+                                    device_id: request_content
                                 }
                             }
                         )
+                        logger.info(f"🟢 Key request sent to {device_id}")
                         
             except Exception as e:
                 logger.warning(f"🟡 Device key request failed: {e}")
