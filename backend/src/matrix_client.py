@@ -58,13 +58,12 @@ class MatrixClient:
                 user=settings.matrix_user_id,
                 device_id=device_id,
                 store_path=self._store_path,
-                store=SqliteStore(
-                    user_id=settings.matrix_user_id,
-                    device_id=device_id, 
-                    store_path=self._store_path,
-                ),  # <-- pass both
                 config=config,
             )
+
+            # Optional: set pickle key for encrypted keys
+            self.client.pickle_key = ELEMENT_KEY_PASSPHRASE
+            
             logger.info("🟢 AsyncClient created successfully with SqliteStore")
             
             # IMPORTANT: Set access token BEFORE loading store or initializing encryption
