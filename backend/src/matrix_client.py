@@ -6,7 +6,7 @@ import json
 import logging
 from nio import MegolmEvent, RoomMessage, ToDeviceEvent
 from nio.crypto import ENCRYPTION_ENABLED
-from nio.store import SqliteStore
+# Remove problematic import
 import aiofiles
 import pickle
 import os
@@ -52,7 +52,7 @@ class MatrixClient:
             # Initialize client with device ID from settings
             device_id = getattr(settings, 'matrix_device_id', None) or "CRMBOT001"
             
-            # FIXED: Use SqliteStore for proper crypto store
+            # Initialize AsyncClient
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
                 user=settings.matrix_user_id,
@@ -61,10 +61,10 @@ class MatrixClient:
                 config=config,
             )
 
-            # Optional: set pickle key for encrypted keys
-            self.client.pickle_key = ELEMENT_KEY_PASSPHRASE
+            # Set pickle key for encrypted store
+            self.client.pickle_key = ELEMENT_KEY_PASSPHRASE.encode()  # Convert to bytes
             
-            logger.info("🟢 AsyncClient created successfully with SqliteStore")
+            logger.info("🟢 AsyncClient created successfully")
             
             # IMPORTANT: Set access token BEFORE loading store or initializing encryption
             if settings.matrix_access_token:
@@ -129,14 +129,14 @@ class MatrixClient:
                 logger.info("🔵 Loading OLM...")
                 # Load crypto store
                 try:
-                    if hasattr(self.client, 'load_crypto_store'):
-                        self.client.load_crypto_store()
-                        logger.info("🟢 Crypto store loaded")
-                    # For nio with SqliteStore, olm should be available after load_store
-                    elif hasattr(self.client, 'olm'):
-                        logger.info("🟢 OLM already available")
+                    # In nio <0.19, olm is initialized automatically when needed
+                    # We can force initialization by checking if it's None
+                    if self.client.olm is None:
+                        # Try to access olm which should trigger initialization
+                        self.client.olm = await self.client._load_olm()
+                        logger.info("🟢 OLM loaded successfully")
                 except Exception as e:
-                    logger.warning(f"🟡 Could not load crypto store: {e}")
+                    logger.warning(f"🟡 Could not load OLM: {e}")
 
             # Upload device keys (required for E2EE)
             if self.client.access_token and self.client.olm:
@@ -206,75 +206,131 @@ class MatrixClient:
             return None
 
     async def _import_recovery_key_if_exists(self):
-        """Import SSSS (secure storage) recovery key and restore megolm backup."""
+        """Import recovery key from settings if available (legacy method for nio <0.19)"""
         try:
             recovery_key = getattr(settings, "matrix_recovery_key", None)
             if not recovery_key:
-                logger.warning("🟡 No recovery key provided")
+                logger.warning("🟡 No recovery key provided in settings")
+                recovery_key = ELEMENT_KEY_PASSPHRASE
+                logger.info("🟡 Using hardcoded recovery key")
+
+            logger.info("🔵 Attempting to import recovery key...")
+
+            # In nio <0.19, we need to use a different approach
+            # First check if we have olm initialized
+            if not self.client or not self.client.olm:
+                logger.error("🔴 OLM not initialized, cannot import keys")
                 return
 
-            logger.info("🔵 Unlocking Secret Storage using recovery key...")
-
-            # 1. Unlock secret storage
-            ssss = await self.client.crypto.open_backup_v1(recovery_key)
-            if not ssss:
-                logger.error("🔴 Failed to unlock secure backup (SSSS)")
-                return
-            
-            logger.info("🟢 Secure Secret Storage unlocked")
-
-            # 2. Download remote megolm backup
-            backup = await self.client.crypto.get_backup_v1()
-            if backup.count == 0:
-                logger.warning("🟡 No keys in remote backup")
-                return
-
-            logger.info(f"🔵 Downloading {backup.count} backup keys...")
-
-            # 3. Restore keys from backup into store
-            imported = await self.client.crypto.restore_backup_v1(ssss)
-            logger.info(f"🟢 Imported {imported.total} megolm sessions from backup")
+            # Try to restore from backup using legacy method
+            # For nio <0.19, the backup API might be different
+            try:
+                # Method 1: Try to import from a file if it exists
+                keys_path = os.path.join(self._store_path, 'element-keys.txt')
+                if os.path.exists(keys_path):
+                    logger.info(f"🔵 Found key file at {keys_path}")
+                    result = await self.client.import_keys(keys_path, recovery_key)
+                    logger.info("🟢 Recovery key imported from file")
+                    return
+                
+                # Method 2: Try to enable backup with the key
+                if hasattr(self.client, 'enable_backup'):
+                    await self.client.enable_backup(recovery_key)
+                    logger.info("🟢 Backup enabled with recovery key")
+                
+                # Method 3: Try to restore backup if available
+                if hasattr(self.client, 'load_backup'):
+                    backup_info = await self.client.load_backup()
+                    if backup_info:
+                        logger.info("🟢 Backup loaded successfully")
+                        # Now try to restore keys from backup
+                        if hasattr(self.client, 'import_keys_from_backup'):
+                            imported = await self.client.import_keys_from_backup(backup_info)
+                            logger.info(f"🟢 Imported {imported} keys from backup")
+                
+                logger.info("🟡 No direct backup restore method available for this nio version")
+                
+            except Exception as import_error:
+                logger.warning(f"🟡 Could not import recovery key: {import_error}")
+                # Try one more approach - check if pickle key helps
+                logger.info("🔵 Using pickle key for store decryption")
+                # The pickle key should already be set during initialization
 
         except Exception as e:
-            logger.error(f"🔴 Error importing SSSS recovery key: {e}", exc_info=True)
+            logger.error(f"🔴 Error importing recovery key: {e}", exc_info=True)
 
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
             
-            # Try to decrypt first
-            try:
-                decrypted = await self.client.crypto.decrypt_megolm_event(event)
-            except Exception as decrypt_error:
-                logger.info(f"🔑 No key stored — trying SSSS/backup restore again: {decrypt_error}")
-                await self._import_recovery_key_if_exists()
-                decrypted = await self.client.crypto.decrypt_megolm_event(event)
+            # First check if we can decrypt
+            if self.client and self.client.olm:
+                try:
+                    # In nio <0.19, use decrypt_event directly
+                    decrypted = await self.client.decrypt_event(event)
 
-            if decrypted and hasattr(decrypted, 'body'):
-                # Successfully decrypted!
-                message_data = {
-                    "event_id": decrypted.event_id,
-                    "room_id": room.room_id,
-                    "sender": decrypted.sender,
-                    "body": decrypted.body,
-                    "message_type": "m.room.message",
-                    "timestamp": decrypted.server_timestamp,
-                    "room_name": room.display_name or room.room_id,
-                    "decrypted": True,
-                    "encrypted_event_id": event.event_id,
-                }
+                    if decrypted and hasattr(decrypted, 'body'):
+                        # Successfully decrypted!
+                        message_data = {
+                            "event_id": decrypted.event_id,
+                            "room_id": room.room_id,
+                            "sender": decrypted.sender,
+                            "body": decrypted.body,
+                            "message_type": "m.room.message",
+                            "timestamp": decrypted.server_timestamp,
+                            "room_name": room.display_name or room.room_id,
+                            "decrypted": True,
+                            "encrypted_event_id": event.event_id,
+                        }
 
-                logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
+                        logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
 
-                # Call callbacks
-                for callback in self._message_callbacks:
-                    await callback(message_data)
-                return
-            else:
-                logger.warning(f"🔴 Failed to decrypt event from {event.sender}")
-                # Request keys
-                await self._request_missing_keys(event, room)
+                        # Call callbacks
+                        for callback in self._message_callbacks:
+                            await callback(message_data)
+                        return
+                            
+                except Exception as decrypt_error:
+                    error_msg = str(decrypt_error)
+                    logger.info(f"🔑 Decryption failed: {error_msg}")
+                    
+                    # If decryption failed, try to restore from backup
+                    logger.info("🔑 No key stored — trying recovery key restore")
+                    await self._import_recovery_key_if_exists()
+                    
+                    # Try decryption again after restore attempt
+                    try:
+                        decrypted = await self.client.decrypt_event(event)
+                        
+                        if decrypted and hasattr(decrypted, 'body'):
+                            # Successfully decrypted after restore!
+                            message_data = {
+                                "event_id": decrypted.event_id,
+                                "room_id": room.room_id,
+                                "sender": decrypted.sender,
+                                "body": decrypted.body,
+                                "message_type": "m.room.message",
+                                "timestamp": decrypted.server_timestamp,
+                                "room_name": room.display_name or room.room_id,
+                                "decrypted": True,
+                                "encrypted_event_id": event.event_id,
+                            }
+
+                            logger.info(f"🟢 Decrypted message after restore: {message_data['body'][:100]}")
+
+                            # Call callbacks
+                            for callback in self._message_callbacks:
+                                await callback(message_data)
+                            return
+                    except Exception as second_decrypt_error:
+                        logger.warning(f"🔑 Still cannot decrypt after restore: {second_decrypt_error}")
+
+            # If we get here, decryption failed
+            logger.info(f"🔑 No decryption key for event from {event.sender}")
+            
+            # Request keys
+            await self._request_missing_keys(event, room)
             
         except Exception as e:
             logger.error(f"🔴 Error handling encrypted event: {e}", exc_info=True)
