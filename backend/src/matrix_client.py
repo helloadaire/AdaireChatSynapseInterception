@@ -6,10 +6,11 @@ import json
 import logging
 from nio import MegolmEvent, RoomMessage, ToDeviceEvent
 from nio.crypto import ENCRYPTION_ENABLED
+from nio.store.async_store import SqliteStore  # ADDED: Import SqliteStore
 import aiofiles
 import pickle
 import os
-import time  # ADD THIS IMPORT
+import time
 
 ELEMENT_KEY_PASSPHRASE = 'IWxCmrVzpjSfqicBIu'
 
@@ -51,14 +52,16 @@ class MatrixClient:
             # Initialize client with device ID from settings
             device_id = getattr(settings, 'matrix_device_id', None) or "CRMBOT001"
             
+            # FIXED: Use SqliteStore for proper crypto store
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
                 user=settings.matrix_user_id,
                 device_id=device_id,
                 store_path=self._store_path,
+                store=SqliteStore(self._store_path),  # ADDED: Proper crypto store
                 config=config,
             )
-            logger.info("🟢 AsyncClient created successfully")
+            logger.info("🟢 AsyncClient created successfully with SqliteStore")
             
             # IMPORTANT: Set access token BEFORE loading store or initializing encryption
             if settings.matrix_access_token:
@@ -80,13 +83,9 @@ class MatrixClient:
 
             # Load store BEFORE initializing encryption
             try:
-                # Try to load store with proper error handling
-                if self.client.store:
-                    # Check if store needs to be loaded
-                    await self.client.load_store()
-                    logger.info("🟢 Store loaded successfully")
-                else:
-                    logger.info("🟡 Store not available, will create new one")
+                # Load the store properly
+                await self.client.load_store()
+                logger.info("🟢 Store loaded successfully")
             except Exception as e:
                 logger.warning(f"🟡 Could not load store: {e}")
 
@@ -125,19 +124,19 @@ class MatrixClient:
             # Ensure OLM is loaded
             if not self.client.olm:
                 logger.info("🔵 Loading OLM...")
-                # Load crypto store - different method for newer nio versions
+                # Load crypto store
                 try:
-                    # Try the new way first
                     if hasattr(self.client, 'load_crypto_store'):
                         self.client.load_crypto_store()
-                    # Alternative: just accessing olm might initialize it
+                        logger.info("🟢 Crypto store loaded")
+                    # For nio with SqliteStore, olm should be available after load_store
                     elif hasattr(self.client, 'olm'):
-                        pass  # Already handled
+                        logger.info("🟢 OLM already available")
                 except Exception as e:
                     logger.warning(f"🟡 Could not load crypto store: {e}")
 
             # Upload device keys (required for E2EE)
-            if self.client.access_token:
+            if self.client.access_token and self.client.olm:
                 try:
                     # First upload our own device keys
                     upload_response = await self.client.keys_upload()
@@ -147,7 +146,6 @@ class MatrixClient:
                         logger.warning("🟡 Device keys upload may have failed")
                     
                     # Initialize encryption - this is crucial!
-                    # Some versions need explicit encryption start
                     if hasattr(self.client, 'start_encryption'):
                         await self.client.start_encryption()
                         logger.info("🟢 Encryption started")
@@ -155,7 +153,7 @@ class MatrixClient:
                 except Exception as e:
                     logger.warning(f"🟡 Key operation warning: {e}")
                     # Check if it's already initialized
-                    if "already uploaded" in str(e).lower():
+                    if "already uploaded" in str(e).lower() or "already exists" in str(e).lower():
                         logger.info("🟢 Device keys already uploaded")
                     else:
                         # Try the deprecated method for compatibility
@@ -205,72 +203,78 @@ class MatrixClient:
             return None
 
     async def _import_recovery_key_if_exists(self):
-        """Import recovery key from settings if available"""
+        """Import SSSS (secure storage) recovery key and restore megolm backup."""
         try:
-            keys_path = os.path.join(self._store_path, 'element-keys.txt')
-            logger.info(f"🔵 Checking for key at location: {keys_path}")
+            recovery_key = getattr(settings, "matrix_recovery_key", None)
+            if not recovery_key:
+                logger.warning("🟡 No recovery key provided")
+                return
 
-            if os.path.exists(keys_path):
-                # Check if store is loaded
-                if not self.client or not self.client.olm:
-                    logger.warning("🟡 OLM not loaded, cannot import keys")
-                    return
+            logger.info("🔵 Unlocking Secret Storage using recovery key...")
 
-                # Try to import keys
-                try:
-                    result = await self.client.import_keys(keys_path, ELEMENT_KEY_PASSPHRASE)
-                    logger.info("🟢 Recovery key imported successfully")
-                except Exception as import_error:
-                    logger.warning(f"🟡 Could not import recovery key: {import_error}")
-            else:
-                logger.warning(f"🟡 No key file found at {keys_path}")
+            # 1. Unlock secret storage
+            ssss = await self.client.crypto.open_backup_v1(recovery_key)
+            if not ssss:
+                logger.error("🔴 Failed to unlock secure backup (SSSS)")
+                return
+            
+            logger.info("🟢 Secure Secret Storage unlocked")
+
+            # 2. Download remote megolm backup
+            backup = await self.client.crypto.get_backup_v1()
+            if backup.count == 0:
+                logger.warning("🟡 No keys in remote backup")
+                return
+
+            logger.info(f"🔵 Downloading {backup.count} backup keys...")
+
+            # 3. Restore keys from backup into store
+            imported = await self.client.crypto.restore_backup_v1(ssss)
+            logger.info(f"🟢 Imported {imported.total} megolm sessions from backup")
+
         except Exception as e:
-            logger.error(f"🔴 Error importing recovery key: {e}")
+            logger.error(f"🔴 Error importing SSSS recovery key: {e}", exc_info=True)
 
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
             
-            # First check if we can decrypt
-            if self.client and hasattr(self.client, 'olm') and self.client.olm:
-                try:
-                    # Try to decrypt
-                    decrypted = await self.client.decrypt_event(event)
+            # Try to decrypt first
+            try:
+                decrypted = await self.client.crypto.decrypt_megolm_event(event)
+            except Exception as decrypt_error:
+                logger.info(f"🔑 No key stored — trying SSSS/backup restore again: {decrypt_error}")
+                await self._import_recovery_key_if_exists()
+                decrypted = await self.client.crypto.decrypt_megolm_event(event)
 
-                    if decrypted and hasattr(decrypted, 'body'):
-                        # Successfully decrypted!
-                        message_data = {
-                            "event_id": decrypted.event_id,
-                            "room_id": room.room_id,
-                            "sender": decrypted.sender,
-                            "body": decrypted.body,
-                            "message_type": "m.room.message",
-                            "timestamp": decrypted.server_timestamp,
-                            "room_name": room.display_name or room.room_id,
-                            "decrypted": True,
-                            "encrypted_event_id": event.event_id,
-                        }
+            if decrypted and hasattr(decrypted, 'body'):
+                # Successfully decrypted!
+                message_data = {
+                    "event_id": decrypted.event_id,
+                    "room_id": room.room_id,
+                    "sender": decrypted.sender,
+                    "body": decrypted.body,
+                    "message_type": "m.room.message",
+                    "timestamp": decrypted.server_timestamp,
+                    "room_name": room.display_name or room.room_id,
+                    "decrypted": True,
+                    "encrypted_event_id": event.event_id,
+                }
 
-                        logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
+                logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
 
-                        # Call callbacks
-                        for callback in self._message_callbacks:
-                            await callback(message_data)
-                        return
-                            
-                except Exception as decrypt_error:
-                    error_msg = str(decrypt_error)
-                    logger.warning(f"🟡 Decryption failed: {error_msg}")
-
-            # If we get here, decryption failed
-            logger.info(f"🔑 No decryption key for event from {event.sender}")
-            
-            # Request keys
-            await self._request_missing_keys(event, room)
+                # Call callbacks
+                for callback in self._message_callbacks:
+                    await callback(message_data)
+                return
+            else:
+                logger.warning(f"🔴 Failed to decrypt event from {event.sender}")
+                # Request keys
+                await self._request_missing_keys(event, room)
             
         except Exception as e:
-            logger.error(f"🔴 Error handling encrypted event: {e}")
+            logger.error(f"🔴 Error handling encrypted event: {e}", exc_info=True)
 
     async def _request_missing_keys(self, event: MegolmEvent, room: MatrixRoom):
         """Request missing encryption keys"""
@@ -710,30 +714,14 @@ class MatrixClient:
             try:
                 # Save the store
                 if hasattr(self.client, 'store') and self.client.store:
-                    # For DefaultStore, we need to use the proper save method
                     try:
-                        # Try to save using store's save method if it exists
                         if hasattr(self.client.store, 'save'):
                             await self.client.store.save()
                             logger.info("🟢 Saved store")
                         else:
-                            # For DefaultStore, we might need to save differently
                             logger.debug("🔵 Store doesn't have save method, skipping")
                     except Exception as save_error:
                         logger.warning(f"🟡 Could not save store: {save_error}")
-                    
-                    # Also backup crypto separately
-                    if hasattr(self.client, 'olm') and self.client.olm:
-                        crypto_store_path = os.path.join(self._store_path, "crypto")
-                        os.makedirs(crypto_store_path, exist_ok=True)
-                        
-                        # Export keys for backup
-                        try:
-                            export_path = os.path.join(crypto_store_path, "exported_keys.txt")
-                            await self.client.export_keys(export_path, ELEMENT_KEY_PASSPHRASE)
-                            logger.info(f"🟢 Exported encryption keys to {export_path}")
-                        except Exception as export_error:
-                            logger.warning(f"🟡 Could not export keys: {export_error}")
             except Exception as e:
                 logger.warning(f"🟡 Error during cleanup: {e}")
 
