@@ -60,6 +60,9 @@ class MatrixClient:
                 store_path=self._store_path,
                 config=config,
             )
+            
+            await self.client.load_store()
+            await self.client.load_crypto_store()
 
             # Optional: set pickle key for encrypted keys
             self.client.pickle_key = ELEMENT_KEY_PASSPHRASE
