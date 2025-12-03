@@ -4,7 +4,7 @@ from typing import Optional, Callable, Dict, Any
 import asyncio
 import json
 import logging
-from nio import MegolmEvent, RoomMessage
+from nio import MegolmEvent, RoomMessage, ToDeviceEvent
 from nio.crypto import ENCRYPTION_ENABLED
 import aiofiles
 import pickle
