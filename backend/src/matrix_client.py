@@ -6,7 +6,7 @@ import json
 import logging
 from nio import MegolmEvent, RoomMessage, ToDeviceEvent
 from nio.crypto import ENCRYPTION_ENABLED
-from nio.store.async_store import SqliteStore  # ADDED: Import SqliteStore
+from nio.store import SqliteStore
 import aiofiles
 import pickle
 import os
