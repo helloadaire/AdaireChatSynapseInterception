@@ -43,7 +43,7 @@ class MatrixClient:
 
             # Create proper ClientConfig object
             config = ClientConfig(
-                encryption_enabled=True,  # Enable E2EE
+                encryption_enabled=True,
                 store_sync_tokens=True,
             )
 
@@ -59,43 +59,41 @@ class MatrixClient:
             )
             logger.info("🟢 AsyncClient created successfully")
             
-            # IMPORTANT: Disable ALL response validation
-            self.client.validate_response = False
-            # Also try to disable on the transport layer if possible
-            if hasattr(self.client, 'transport') and hasattr(self.client.transport, 'validate_response'):
-                self.client.transport.validate_response = False
-
-            # Set access token if provided
+            # IMPORTANT: Set access token BEFORE loading store or initializing encryption
             if settings.matrix_access_token:
                 self.client.access_token = settings.matrix_access_token
                 self.client.user_id = settings.matrix_user_id
                 logger.info("🟢 Using provided access token")
             else:
-                logger.warning("🟡 No access token provided. Client may not be able to sync.")
+                logger.error("🔴 Access token required for E2EE")
+                raise ValueError("Access token required")
 
-            # Add event callbacks BEFORE loading store
+            # Disable response validation (optional but can help with compatibility)
+            self.client.validate_response = False
+
+            # Add event callbacks
             self.client.add_event_callback(self._on_message, RoomMessageText)
             self.client.add_event_callback(self._on_encrypted, MegolmEvent)
+            # Add key request callback
+            self.client.add_event_callback(self._handle_to_device_event, (ToDeviceEvent,))
 
-            # Try to load store - but don't fail if it doesn't exist
+            # Load store BEFORE initializing encryption
             try:
                 await self.client.load_store()
                 logger.info("🟢 Store loaded successfully")
             except Exception as e:
                 logger.warning(f"🟡 Could not load store (might not exist yet): {e}")
+                # Create new store if doesn't exist
+                if "not exist" in str(e):
+                    logger.info("🟡 Creating new store...")
 
-            # Initialize encryption
-            await self._initialize_encryption()
+            # Initialize encryption PROPERLY
+            await self._initialize_encryption_properly()
 
-            # Try to import recovery key
+            # Import recovery key if available
             await self._import_recovery_key_if_exists()
 
-            # Log configuration
-            logger.info(f"🔵 Configured for homeserver: {settings.matrix_homeserver_url}")
-            logger.info(f"🔵 User ID: {settings.matrix_user_id}")
-            logger.info(f"🔵 Device ID: {device_id}")
-
-            # Start syncing
+            # Start sync
             if self.client and self.client.access_token:
                 asyncio.create_task(self._start_syncing())
                 logger.info("🔄 Starting sync with E2EE...")
@@ -107,6 +105,63 @@ class MatrixClient:
             logger.error(f"🔴 Failed to initialize Matrix client: {e}", exc_info=True)
             self._initialized = False
             raise
+        
+    async def _initialize_encryption_properly(self):
+        """Properly initialize E2EE encryption"""
+        try:
+            logger.info("🔵 Initializing encryption properly...")
+
+            if not self.client:
+                raise RuntimeError("Client not available")
+
+            # Ensure OLM is loaded
+            if not self.client.olm:
+                logger.info("🔵 Loading OLM...")
+                # Load crypto store
+                self.client.load_crypto_store()
+
+            # Upload device keys (required for E2EE)
+            if self.client.access_token:
+                try:
+                    # First query our own keys
+                    await self.client.keys_query({self.client.user_id: []})
+                    
+                    # Upload device keys if needed
+                    await self.client.keys_upload()
+                    logger.info("🟢 Device keys uploaded")
+                    
+                    # Share keys with users we might communicate with
+                    # This is crucial for the bot to receive encrypted messages
+                    await self.client.keys_claim()
+                    
+                except Exception as e:
+                    logger.warning(f"🟡 Key operation warning: {e}")
+                    # Continue anyway - might already be uploaded
+
+            logger.info("🟢 Encryption initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"🔴 Failed to initialize encryption: {e}")
+            # Don't re-raise - we might operate in degraded mode
+
+    async def _handle_to_device_event(self, event):
+        """Handle to-device events (key sharing)"""
+        try:
+            logger.debug(f"🔵 Received to-device event of type: {event.type}")
+            
+            if event.type == "m.room_key":
+                logger.info("🟢 Received room key event")
+                # The client should automatically process this and store the key
+                
+            elif event.type == "m.forwarded_room_key":
+                logger.info("🟢 Received forwarded room key")
+                
+            elif event.type == "m.room_key_request":
+                logger.info(f"🔑 Key request from {event.sender}")
+                # Handle key requests if needed
+                
+        except Exception as e:
+            logger.error(f"🔴 Error handling to-device event: {e}")
 
     async def request_keys_for_event(self, event: MegolmEvent):
         """Request encryption keys for a specific encrypted event"""
@@ -150,60 +205,164 @@ class MatrixClient:
         try:
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
             
-            # Check if we can decrypt
-            if not self.client or not self.client.olm:
-                logger.warning("🟡 OLM not initialized, cannot decrypt")
-                return
+            # First check if we can decrypt
+            if self.client and hasattr(self.client, 'olm') and self.client.olm:
+                try:
+                    # Try to decrypt
+                    decrypted = await self.client.decrypt_event(event)
 
-            try:
-                # Try to decrypt
-                decrypted = await self.client.decrypt_event(event)
+                    if decrypted and hasattr(decrypted, 'body'):
+                        # Successfully decrypted!
+                        message_data = {
+                            "event_id": decrypted.event_id,
+                            "room_id": room.room_id,
+                            "sender": decrypted.sender,
+                            "body": decrypted.body,
+                            "message_type": "m.room.message",
+                            "timestamp": decrypted.server_timestamp,
+                            "room_name": room.display_name or room.room_id,
+                            "decrypted": True,
+                            "encrypted_event_id": event.event_id,
+                        }
 
-                if decrypted and hasattr(decrypted, 'body'):
-                    # Successfully decrypted!
-                    message_data = {
-                        "event_id": decrypted.event_id,
-                        "room_id": room.room_id,
-                        "sender": decrypted.sender,
-                        "body": decrypted.body,
-                        "message_type": "m.room.message",
-                        "timestamp": decrypted.server_timestamp,
-                        "room_name": room.display_name or room.room_id,
-                        "decrypted": True,
-                        "encrypted_event_id": event.event_id,
-                    }
+                        logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
 
-                    logger.info(f"🟢 Decrypted message: {message_data['body'][:100]}")
+                        # Call callbacks
+                        for callback in self._message_callbacks:
+                            await callback(message_data)
+                        return
+                            
+                except Exception as decrypt_error:
+                    error_msg = str(decrypt_error)
+                    logger.warning(f"🟡 Decryption failed: {error_msg}")
 
-                    # Call callbacks
-                    for callback in self._message_callbacks:
-                        await callback(message_data)
-                else:
-                    logger.warning(f"🟡 Could not decrypt event from {event.sender}")
-                    
-                    # Request keys for this specific event
-                    logger.info(f"🔑 Requesting keys for event from {event.sender}")
-                    await self.request_keys_for_event(event)
-
-            except Exception as decrypt_error:
-                error_msg = str(decrypt_error)
-                logger.warning(f"🟡 Decryption failed: {error_msg}")
-                
-                # Check if it's a "no session" error
-                if "no session found" in error_msg or "undecryptable Megolm event" in error_msg:
-                    logger.info(f"🔑 No session found for {event.sender}, requesting keys...")
-                    
-                    # Extract device ID if available
-                    if hasattr(event, 'device_id'):
-                        device_id = event.device_id
-                        logger.info(f"   Device ID: {device_id}")
-                    
-                    # Request keys for this specific event
-                    await self.request_keys_for_event(event)
-
+            # If we get here, decryption failed
+            logger.info(f"🔑 No decryption key for event from {event.sender}")
+            
+            # Request keys
+            await self._request_missing_keys(event, room)
+            
         except Exception as e:
             logger.error(f"🔴 Error handling encrypted event: {e}")
 
+    async def _request_missing_keys(self, event: MegolmEvent, room: MatrixRoom):
+        """Request missing encryption keys"""
+        try:
+            if not self.client:
+                return
+                
+            logger.info(f"🔑 Requesting missing keys for event from {event.sender}")
+            
+            # Extract session info
+            session_id = getattr(event, 'session_id', None)
+            sender_key = getattr(event, 'sender_key', None)
+            
+            if session_id:
+                logger.info(f"   Session ID: {session_id[:20]}...")
+            
+            # Method 1: Request room key directly
+            try:
+                await self.client.request_room_key(event)
+                logger.info("🟢 Room key requested")
+            except Exception as e:
+                logger.warning(f"🟡 Direct key request failed: {e}")
+                
+            # Method 2: Query user's devices and send key requests
+            try:
+                # Query the sender's devices
+                query_response = await self.client.keys_query({event.sender: []})
+                
+                if query_response and hasattr(query_response, 'device_keys'):
+                    devices = query_response.device_keys.get(event.sender, {})
+                    
+                    for device_id in devices.keys():
+                        logger.info(f"🔑 Sending key request to device {device_id}")
+                        
+                        # Create a key request
+                        request = {
+                            "algorithm": "m.megolm.v1.aes-sha2",
+                            "room_id": room.room_id,
+                            "sender_key": sender_key,
+                            "session_id": session_id,
+                        }
+                        
+                        # Send to-device message requesting keys
+                        await self.client.send_to_device(
+                            "m.room_key_request",
+                            {
+                                event.sender: {
+                                    device_id: {
+                                        "action": "request",
+                                        "requesting_device_id": self.client.device_id,
+                                        "request_id": f"req_{int(time.time())}",
+                                        "body": request
+                                    }
+                                }
+                            }
+                        )
+                        
+            except Exception as e:
+                logger.warning(f"🟡 Device key request failed: {e}")
+                
+        except Exception as e:
+            logger.error(f"🔴 Failed to request missing keys: {e}")
+    
+    async def create_encrypted_room(self, name: str, invitees: Optional[list] = None):
+        """Create an encrypted room"""
+        try:
+            room_id = await self.create_room(
+                name=name,
+                invitees=invitees,
+                initial_state=[
+                    {
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "content": {
+                            "algorithm": "m.megolm.v1.aes-sha2"
+                        }
+                    },
+                    {
+                        "type": "m.room.history_visibility",
+                        "state_key": "",
+                        "content": {
+                            "history_visibility": "shared"
+                        }
+                    }
+                ],
+                power_level_content_override={
+                    "users": {
+                        self.client.user_id: 100,
+                        **{user: 50 for user in (invitees or [])}
+                    }
+                }
+            )
+            
+            logger.info(f"🟢 Created encrypted room: {room_id}")
+            return room_id
+            
+        except Exception as e:
+            logger.error(f"🔴 Failed to create encrypted room: {e}")
+            raise
+    
+    async def verify_user_device(self, user_id: str, device_id: str):
+        """Manually verify a user's device"""
+        try:
+            logger.info(f"🔐 Verifying device {device_id} for user {user_id}")
+            
+            # Get device info
+            devices = await self.client.query_keys({user_id: []})
+            
+            if user_id in devices and device_id in devices[user_id]:
+                # Manually mark as verified
+                await self.client.set_device_verified(user_id, device_id, verified=True)
+                logger.info(f"🟢 Device {device_id} verified")
+                return True
+                
+        except Exception as e:
+            logger.error(f"🔴 Failed to verify device: {e}")
+        
+        return False
+    
     async def _initialize_encryption(self):
         """Initialize E2EE encryption store"""
         try:
