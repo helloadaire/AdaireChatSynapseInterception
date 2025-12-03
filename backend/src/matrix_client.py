@@ -58,7 +58,11 @@ class MatrixClient:
                 user=settings.matrix_user_id,
                 device_id=device_id,
                 store_path=self._store_path,
-                store=SqliteStore(device_id, self._store_path),  # <-- pass both
+                store=SqliteStore(
+                    user_id=settings.matrix_user_id,
+                    device_id=device_id, 
+                    store_path=self._store_path,
+                ),  # <-- pass both
                 config=config,
             )
             logger.info("🟢 AsyncClient created successfully with SqliteStore")
