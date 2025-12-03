@@ -52,11 +52,11 @@ class MatrixClient:
             # Initialize client with device ID from settings
             device_id = getattr(settings, 'matrix_device_id', None) or "CRMBOT001"
             
-            print("RUNTIMR_USER_ID: ",settings.matrix_user_id)
+            user_id = getattr(settings, 'matrix_user_id', '').strip()
             # FIXED: Use SqliteStore for proper crypto store
             self.client = AsyncClient(
                 homeserver=settings.matrix_homeserver_url,
-                user=settings.matrix_user_id,
+                user=user_id,
                 device_id=device_id,
                 store_path=self._store_path,
                 config=config,
