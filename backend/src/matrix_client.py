@@ -255,6 +255,44 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"🔴 Error importing recovery key: {e}", exc_info=True)
 
+    async def request_session_keys_aggressively(self, user_id: str, room_id: str):
+        """Forcefully request session keys from a user"""
+        try:
+            logger.info(f"🔑 Aggressively requesting session keys from {user_id}")
+            
+            # First, mark the user's device as trusted
+            response = await self.client.query_keys({user_id: []})
+            
+            if user_id in response.device_keys:
+                for device_id in response.device_keys[user_id].keys():
+                    # Mark device as verified/trusted
+                    await self.client.set_device_verified(user_id, device_id, verified=True)
+                    logger.info(f"🔐 Marked device {device_id} as verified")
+                    
+                    # Send key request
+                    await self.client.to_device(
+                        "m.room_key_request",
+                        {
+                            user_id: {
+                                device_id: {
+                                    "action": "request",
+                                    "requesting_device_id": self.client.device_id,
+                                    "request_id": f"force_req_{int(time.time())}",
+                                    "body": {
+                                        "algorithm": "m.megolm.v1.aes-sha2",
+                                        "room_id": room_id,
+                                        "sender_key": "",  # This will request all session keys
+                                        "session_id": "",  # Empty means all sessions
+                                    }
+                                }
+                            }
+                        }
+                    )
+                    logger.info(f"🟢 Sent aggressive key request to {device_id}")
+                    
+        except Exception as e:
+            logger.error(f"🔴 Failed to aggressively request keys: {e}")
+
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
