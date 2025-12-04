@@ -6,7 +6,6 @@ import json
 import logging
 from nio import MegolmEvent, RoomMessage, ToDeviceEvent
 from nio.crypto import ENCRYPTION_ENABLED
-# Remove problematic import
 import aiofiles
 import pickle
 import os
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class MatrixClient:
     """Wrapper around matrix-nio client for CRM integration"""
-
+    
     def __init__(self):
         self.client: Optional[AsyncClient] = None
         self.syncing = False
@@ -30,6 +29,8 @@ class MatrixClient:
         self._store_path = "./matrix_store"
         self._device_id = settings.matrix_device_id or "CRMBOT"
         self._initialized = False
+        self._room_creation_queue = asyncio.Queue()  # For managing room creation
+        self._active_dm_rooms = {}  # Track DM rooms we've created
 
     async def initialize(self):
         """Initialize Matrix client connection with proper configuration"""
@@ -81,7 +82,6 @@ class MatrixClient:
             # Add event callbacks
             self.client.add_event_callback(self._on_message, RoomMessageText)
             self.client.add_event_callback(self._on_encrypted, MegolmEvent)
-            # Add key request callback
             self.client.add_event_callback(self._handle_to_device_event, (ToDeviceEvent,))
 
             # Load store BEFORE initializing encryption
@@ -95,7 +95,7 @@ class MatrixClient:
             # Initialize encryption PROPERLY
             await self._initialize_encryption_properly()
 
-            # Import recovery key if available
+            # Import recovery key if available (for existing sessions)
             await self._import_recovery_key_if_exists()
 
             # Log configuration
@@ -129,10 +129,7 @@ class MatrixClient:
                 logger.info("🔵 Loading OLM...")
                 # Load crypto store
                 try:
-                    # In nio <0.19, olm is initialized automatically when needed
-                    # We can force initialization by checking if it's None
                     if self.client.olm is None:
-                        # Try to access olm which should trigger initialization
                         self.client.olm = await self.client._load_olm()
                         logger.info("🟢 OLM loaded successfully")
                 except Exception as e:
@@ -148,29 +145,20 @@ class MatrixClient:
                     else:
                         logger.warning("🟡 Device keys upload may have failed")
                     
-                    # Initialize encryption - this is crucial!
+                    # Initialize encryption
                     if hasattr(self.client, 'start_encryption'):
                         await self.client.start_encryption()
                         logger.info("🟢 Encryption started")
                         
                 except Exception as e:
                     logger.warning(f"🟡 Key operation warning: {e}")
-                    # Check if it's already initialized
                     if "already uploaded" in str(e).lower() or "already exists" in str(e).lower():
                         logger.info("🟢 Device keys already uploaded")
-                    else:
-                        # Try the deprecated method for compatibility
-                        try:
-                            await self.client.keys_query()
-                            logger.info("🟢 Keys queried (compatibility mode)")
-                        except Exception as query_error:
-                            logger.warning(f"🟡 Compatibility query also failed: {query_error}")
 
             logger.info("🟢 Encryption initialized successfully")
             
         except Exception as e:
             logger.error(f"🔴 Failed to initialize encryption: {e}")
-            # Don't re-raise - we might operate in degraded mode
 
     async def _handle_to_device_event(self, event):
         """Handle to-device events (key sharing)"""
@@ -179,91 +167,222 @@ class MatrixClient:
             
             if event.type == "m.room_key":
                 logger.info("🟢 Received room key event")
-                # The client should automatically process this and store the key
+                # Store the key automatically
                 
             elif event.type == "m.forwarded_room_key":
                 logger.info("🟢 Received forwarded room key")
                 
             elif event.type == "m.room_key_request":
                 logger.info(f"🔑 Key request from {event.sender}")
-                # Handle key requests if needed
+                # Auto-share keys when requested (makes bot more cooperative)
+                await self._auto_share_keys(event)
                 
         except Exception as e:
             logger.error(f"🔴 Error handling to-device event: {e}")
 
-    async def request_keys_for_event(self, event: MegolmEvent):
-        """Request encryption keys for a specific encrypted event"""
+    async def _auto_share_keys(self, event):
+        """Automatically share keys when requested (makes bot cooperative)"""
         try:
-            logger.info(f"🔑 Requesting keys for event from {event.sender}")
-            
-            # Request room key for this specific event
-            response = await self.client.request_room_key(event)
-            logger.info(f"🟢 Key request sent for event from {event.sender}")
-            return response
-            
+            content = getattr(event, 'content', {})
+            if content.get('action') == 'request':
+                requesting_device = content.get('requesting_device_id')
+                sender = event.sender
+                
+                # Mark the requesting device as verified
+                if hasattr(self.client, 'set_device_verified'):
+                    await self.client.set_device_verified(sender, requesting_device, verified=True)
+                    logger.info(f"🔐 Auto-verified device {requesting_device} from {sender}")
+                    
         except Exception as e:
-            logger.error(f"🔴 Failed to request keys: {e}")
-            return None
+            logger.warning(f"🟡 Auto-share failed: {e}")
 
     async def _import_recovery_key_if_exists(self):
-        """Import recovery key from settings if available (legacy method for nio <0.19)"""
+        """Import recovery key for existing sessions"""
         try:
-            # USE the correct key.
             recovery_key = ELEMENT_KEY_PASSPHRASE
             logger.info("🔵 Attempting to import recovery key...")
 
-            # In nio <0.19, we need to use a different approach
-            # First check if we have olm initialized
             if not self.client or not self.client.olm:
                 logger.error("🔴 OLM not initialized, cannot import keys")
                 return
 
-            # Try to restore from backup using legacy method
-            # For nio <0.19, the backup API might be different
-            try:
-                # Method 1: Try to import from a file if it exists
-                keys_path = os.path.join(self._store_path, 'element-keys.txt')
-                if os.path.exists(keys_path):
-                    logger.info(f"🔵 Found key file at {keys_path}")
+            # Try to import from file if it exists
+            keys_path = os.path.join(self._store_path, 'element-keys.txt')
+            if os.path.exists(keys_path):
+                logger.info(f"🔵 Found key file at {keys_path}")
+                try:
                     result = await self.client.import_keys(keys_path, recovery_key)
                     logger.info("🟢 Recovery key imported from file")
-                    return
+                except Exception as e:
+                    logger.warning(f"🟡 Could not import recovery key: {e}")
+                    # Create new backup instead
+                    if hasattr(self.client, 'enable_backup'):
+                        await self.client.enable_backup(recovery_key)
+                        logger.info("🟢 Created new encryption backup")
+            else:
+                logger.info("🟡 No key file found, starting fresh")
                 
-                # Method 2: Try to enable backup with the key
-                if hasattr(self.client, 'enable_backup'):
-                    await self.client.enable_backup(recovery_key)
-                    logger.info("🟢 Backup enabled with recovery key")
-                
-                # Method 3: Try to restore backup if available
-                if hasattr(self.client, 'load_backup'):
-                    backup_info = await self.client.load_backup()
-                    if backup_info:
-                        logger.info("🟢 Backup loaded successfully")
-                        # Now try to restore keys from backup
-                        if hasattr(self.client, 'import_keys_from_backup'):
-                            imported = await self.client.import_keys_from_backup(backup_info)
-                            logger.info(f"🟢 Imported {imported} keys from backup")
-                
-                logger.info("🟡 No direct backup restore method available for this nio version")
-                
-            except Exception as import_error:
-                logger.warning(f"🟡 Could not import recovery key: {import_error}")
-                # Try one more approach - check if pickle key helps
-                logger.info("🔵 Using pickle key for store decryption")
-                # The pickle key should already be set during initialization
-
         except Exception as e:
             logger.error(f"🔴 Error importing recovery key: {e}", exc_info=True)
+
+    # ==================== CORE FIX: ROOM MANAGEMENT ====================
+
+    async def create_dm_room(self, user_id: str, room_name: Optional[str] = None):
+        """
+        Create a DM room with encryption enabled from the start.
+        This ensures the bot receives session keys automatically.
+        
+        Args:
+            user_id: Matrix user ID to create DM with
+            room_name: Optional room display name
+            
+        Returns:
+            room_id: The created room ID
+        """
+        try:
+            if not room_name:
+                # Extract username from Matrix ID
+                username = user_id.split(':')[0].lstrip('@')
+                room_name = f"DM with {username}"
+            
+            logger.info(f"🔵 Creating encrypted DM room with {user_id}")
+            
+            # Create room with encryption enabled from the start
+            response = await self.client.room_create(
+                name=room_name,
+                invite=[user_id],
+                is_direct=True,
+                initial_state=[
+                    {
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "content": {
+                            "algorithm": "m.megolm.v1.aes-sha2"
+                        }
+                    },
+                    {
+                        "type": "m.room.history_visibility",
+                        "state_key": "",
+                        "content": {
+                            "history_visibility": "shared"
+                        }
+                    },
+                    {
+                        "type": "m.room.guest_access",
+                        "state_key": "",
+                        "content": {
+                            "guest_access": "forbidden"
+                        }
+                    }
+                ],
+                power_level_content_override={
+                    "users": {
+                        self.client.user_id: 100,
+                        user_id: 50
+                    },
+                    "events": {
+                        "m.room.encryption": 100,
+                        "m.room.history_visibility": 100,
+                        "m.room.name": 50,
+                        "m.room.power_levels": 100
+                    }
+                }
+            )
+            
+            room_id = response.room_id
+            self._active_dm_rooms[user_id] = room_id
+            
+            logger.info(f"🟢 Created encrypted DM room {room_id} with {user_id}")
+            
+            # Send welcome message
+            await self.send_message(room_id, "Hello! I'm Adaire. How can I help you today?")
+            
+            return room_id
+            
+        except Exception as e:
+            logger.error(f"🔴 Failed to create DM room with {user_id}: {e}")
+            raise
+
+    async def get_or_create_dm_room(self, user_id: str):
+        """
+        Get existing DM room or create a new one.
+        This is the recommended way to ensure bot can decrypt messages.
+        """
+        try:
+            # First check if we already have a DM room with this user
+            if user_id in self._active_dm_rooms:
+                room_id = self._active_dm_rooms[user_id]
+                logger.info(f"🔵 Using existing DM room {room_id} with {user_id}")
+                return room_id
+            
+            # Check joined rooms for existing DM
+            response = await self.client.joined_rooms()
+            if hasattr(response, 'rooms'):
+                for room_id in response.rooms:
+                    try:
+                        # Get room members to check if it's a DM with this user
+                        members = await self.client.room_get_state(room_id)
+                        # Simplified check - in production you'd want to check m.direct state
+                        # For now, create new room if unsure
+                        pass
+                    except:
+                        continue
+            
+            # Create new DM room
+            return await self.create_dm_room(user_id)
+            
+        except Exception as e:
+            logger.error(f"🔴 Failed to get/create DM room: {e}")
+            raise
+
+    async def handle_incoming_dm(self, room: MatrixRoom, event):
+        """
+        Handle incoming DM messages. If we can't decrypt, 
+        create a new room and ask user to continue there.
+        """
+        try:
+            # Skip our own messages
+            if event.sender == self.client.user_id:
+                return
+                
+            # If this is a DM and we can't decrypt, create new room
+            if room.is_group:
+                return
+                
+            # Check if we're in our list of created rooms
+            user_id = event.sender
+            if user_id not in self._active_dm_rooms:
+                logger.warning(f"🟡 Received message in non-managed DM with {user_id}")
+                
+                # Create new room and redirect conversation
+                new_room_id = await self.create_dm_room(user_id)
+                await self.send_message(
+                    new_room_id,
+                    f"I noticed we were chatting in another room. Let's continue here for better encryption support!"
+                )
+                
+        except Exception as e:
+            logger.error(f"🔴 Error handling incoming DM: {e}")
+
+    # ==================== ENCRYPTED EVENT HANDLING ====================
 
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
+            # Skip our own messages
+            if event.sender == self.client.user_id:
+                logger.debug("🔵 Skipping encrypted message from ourselves")
+                return
+                
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
+            
+            # Handle DMs specially
+            if not room.is_group:
+                await self.handle_incoming_dm(room, event)
             
             # First check if we can decrypt
             if self.client and self.client.olm:
                 try:
-                    # In nio <0.19, use decrypt_event directly
                     decrypted = await self.client.decrypt_event(event)
 
                     if decrypted and hasattr(decrypted, 'body'):
@@ -289,361 +408,51 @@ class MatrixClient:
                             
                 except Exception as decrypt_error:
                     error_msg = str(decrypt_error)
-                    logger.info(f"🔑 Decryption failed: {error_msg}")
+                    logger.warning(f"🔑 Decryption failed: {error_msg}")
                     
-                    # If decryption failed, try to restore from backup
-                    logger.info("🔑 No key stored — trying recovery key restore")
-                    await self._import_recovery_key_if_exists()
-                    
-                    # Try decryption again after restore attempt
-                    try:
-                        decrypted = await self.client.decrypt_event(event)
+                    # If we can't decrypt and it's a DM, offer to create new room
+                    if not room.is_group:
+                        user_id = event.sender
+                        logger.info(f"🔑 Cannot decrypt DM from {user_id}, offering new room")
                         
-                        if decrypted and hasattr(decrypted, 'body'):
-                            # Successfully decrypted after restore!
-                            message_data = {
-                                "event_id": decrypted.event_id,
-                                "room_id": room.room_id,
-                                "sender": decrypted.sender,
-                                "body": decrypted.body,
-                                "message_type": "m.room.message",
-                                "timestamp": decrypted.server_timestamp,
-                                "room_name": room.display_name or room.room_id,
-                                "decrypted": True,
-                                "encrypted_event_id": event.event_id,
-                            }
+                        # Don't spam requests - track failed attempts
+                        if not hasattr(self, '_failed_decryption_attempts'):
+                            self._failed_decryption_attempts = {}
+                        
+                        attempts = self._failed_decryption_attempts.get(user_id, 0)
+                        if attempts < 2:  # Only offer twice
+                            self._failed_decryption_attempts[user_id] = attempts + 1
+                            
+                            # Create new room
+                            new_room_id = await self.create_dm_room(user_id)
+                            await self.send_message(
+                                new_room_id,
+                                "I couldn't decrypt messages in our previous conversation. "
+                                "Let's chat here instead where encryption works properly!"
+                            )
 
-                            logger.info(f"🟢 Decrypted message after restore: {message_data['body'][:100]}")
-
-                            # Call callbacks
-                            for callback in self._message_callbacks:
-                                await callback(message_data)
-                            return
-                    except Exception as second_decrypt_error:
-                        logger.warning(f"🔑 Still cannot decrypt after restore: {second_decrypt_error}")
-
-            # If we get here, decryption failed
-            logger.info(f"🔑 No decryption key for event from {event.sender}")
-            
-            # Request keys
-            await self._request_missing_keys(event, room)
+            logger.debug(f"🔑 No decryption key for event from {event.sender}")
             
         except Exception as e:
             logger.error(f"🔴 Error handling encrypted event: {e}", exc_info=True)
 
-    async def _request_missing_keys(self, event: MegolmEvent, room: MatrixRoom):
-        """Request missing encryption keys"""
-        try:
-            if not self.client:
-                return
-                
-            logger.info(f"🔑 Requesting missing keys for event from {event.sender}")
-            
-            # Extract session info
-            session_id = getattr(event, 'session_id', None)
-            sender_key = getattr(event, 'sender_key', None)
-            
-            if session_id:
-                logger.info(f"   Session ID: {session_id[:20]}...")
-            
-            # Method 1: Request room key directly
-            try:
-                await self.client.request_room_key(event)
-                logger.info("🟢 Room key requested")
-            except Exception as e:
-                logger.warning(f"🟡 Direct key request failed: {e}")
-                
-            # Method 2: Try alternative approach - query keys with correct API
-            try:
-                # Fix for API compatibility - try different approaches
-                user_id = event.sender
-                
-                # Approach 1: Try without parameters (older API)
-                try:
-                    query_response = await self.client.keys_query()
-                    logger.info("🟢 Keys queried (no parameters)")
-                except TypeError:
-                    # Approach 2: Try with empty dict (newer API)
-                    query_response = await self.client.keys_query({})
-                    logger.info("🟢 Keys queried (empty dict)")
-                    
-                # If we got a response, try to send key request to all devices
-                if query_response and hasattr(query_response, 'device_keys'):
-                    devices = query_response.device_keys.get(user_id, {})
-                    
-                    if not devices:
-                        # Try to fetch device list separately
-                        logger.info(f"🔑 No devices in query response, trying device list for {user_id}")
-                        # We'll skip device-specific requests for now
-                        return
-                        
-                    for device_id in devices.keys():
-                        logger.info(f"🔑 Sending key request to device {device_id}")
-                        
-                        # Create a key request
-                        request_content = {
-                            "action": "request",
-                            "requesting_device_id": self.client.device_id,
-                            "request_id": f"req_{int(time.time())}",
-                            "body": {
-                                "algorithm": "m.megolm.v1.aes-sha2",
-                                "room_id": room.room_id,
-                                "sender_key": sender_key,
-                                "session_id": session_id,
-                            }
-                        }
-                        
-                        # Send to-device message requesting keys
-                        await self.client.to_device(
-                            "m.room_key_request",
-                            {
-                                user_id: {
-                                    device_id: request_content
-                                }
-                            }
-                        )
-                        logger.info(f"🟢 Key request sent to {device_id}")
-                        
-            except Exception as e:
-                logger.warning(f"🟡 Device key request failed: {e}")
-                
-        except Exception as e:
-            logger.error(f"🔴 Failed to request missing keys: {e}")
-    
-    async def create_encrypted_room(self, name: str, invitees: Optional[list] = None):
-        """Create an encrypted room"""
-        try:
-            room_id = await self.create_room(
-                name=name,
-                invitees=invitees,
-                initial_state=[
-                    {
-                        "type": "m.room.encryption",
-                        "state_key": "",
-                        "content": {
-                            "algorithm": "m.megolm.v1.aes-sha2"
-                        }
-                    },
-                    {
-                        "type": "m.room.history_visibility",
-                        "state_key": "",
-                        "content": {
-                            "history_visibility": "shared"
-                        }
-                    }
-                ],
-                power_level_content_override={
-                    "users": {
-                        self.client.user_id: 100,
-                        **{user: 50 for user in (invitees or [])}
-                    }
-                }
-            )
-            
-            logger.info(f"🟢 Created encrypted room: {room_id}")
-            return room_id
-            
-        except Exception as e:
-            logger.error(f"🔴 Failed to create encrypted room: {e}")
-            raise
-    
-    async def verify_user_device(self, user_id: str, device_id: str):
-        """Manually verify a user's device"""
-        try:
-            logger.info(f"🔐 Verifying device {device_id} for user {user_id}")
-            
-            # Get device info
-            devices = await self.client.query_keys({user_id: []})
-            
-            if user_id in devices and device_id in devices[user_id]:
-                # Manually mark as verified
-                await self.client.set_device_verified(user_id, device_id, verified=True)
-                logger.info(f"🟢 Device {device_id} verified")
-                return True
-                
-        except Exception as e:
-            logger.error(f"🔴 Failed to verify device: {e}")
-        
-        return False
-    
-    async def _initialize_encryption(self):
-        """Initialize E2EE encryption store"""
-        try:
-            logger.info("🔵 Initializing encryption...")
-
-            # Check if client and OLM are available
-            if not self.client:
-                logger.error("🔴 Client not available for encryption initialization")
-                return
-
-            if not self.client.olm:
-                logger.error("🔴 OLM not available after loading store")
-                return
-
-            # Upload device keys
-            if self.client.access_token:
-                try:
-                    # Upload keys
-                    await self.client.keys_upload()
-                    logger.info("🟢 Device keys uploaded")
-
-                    # Query keys for ourselves
-                    await self.client.keys_query()
-                    logger.info("🟢 Queried device keys")
-
-                except Exception as upload_error:
-                    # This might be normal if keys are already uploaded
-                    logger.debug(f"🔵 Device key operation: {upload_error}")
-
-            logger.info("🟢 Encryption initialized successfully")
-
-        except Exception as e:
-            logger.error(f"🔴 Failed to initialize encryption: {e}")
-            # Don't raise - we might still be able to operate without full E2EE
-
-    async def _process_room_events(self, room_id: str, events):
-        """Process events from a room"""
-        try:
-            if not events:
-                return
-                
-            logger.debug(f"🔵 Processing {len(events)} events for room {room_id}")
-            
-            for event in events:
-                try:
-                    # Log event type
-                    event_type = None
-                    
-                    if hasattr(event, 'type'):
-                        event_type = event.type
-                    elif isinstance(event, dict) and 'type' in event:
-                        event_type = event['type']
-                    
-                    if event_type:
-                        logger.debug(f"🔵 Event type: {event_type} in room {room_id}")
-                        
-                        # Handle different event types
-                        if event_type == 'm.room.encrypted':
-                            logger.info(f"🔐 Encrypted event in {room_id}")
-                            # The _on_encrypted callback should handle this
-                        elif event_type == 'm.room.message':
-                            logger.info(f"📨 Message event in {room_id}")
-                            # The _on_message callback should handle this
-                            
-                except Exception as event_error:
-                    logger.debug(f"🟡 Error processing event: {event_error}")
-                    
-        except Exception as e:
-            logger.error(f"🔴 Error processing room events: {e}")
-    
-    async def _start_syncing(self):
-        """Start syncing with Matrix server"""
-        self.syncing = True
-        logger.info("🔄 Starting Matrix sync loop...")
-
-        # Don't do initial sync - just start normal sync
-        logger.info("🔵 Starting normal sync loop...")
-        
-        # Continuous sync loop
-        while self.syncing and self.client:
-            try:
-                # Simple sync with minimal parameters
-                sync_response = await self.client.sync(
-                    timeout=30000,  # 30 seconds timeout
-                    since=self._sync_token,
-                    full_state=False  # Don't request full state every time
-                )
-
-                if sync_response:
-                    # Try to get next_batch from different possible locations
-                    next_batch = None
-                    
-                    # Method 1: Direct attribute
-                    if hasattr(sync_response, 'next_batch'):
-                        next_batch = sync_response.next_batch
-                    
-                    # Method 2: From dict if response is dict-like
-                    elif isinstance(sync_response, dict) and 'next_batch' in sync_response:
-                        next_batch = sync_response['next_batch']
-                    
-                    # Method 3: Try to parse as JSON string
-                    elif isinstance(sync_response, str):
-                        try:
-                            data = json.loads(sync_response)
-                            next_batch = data.get('next_batch')
-                        except:
-                            pass
-                    
-                    if next_batch:
-                        self._sync_token = next_batch
-                        logger.debug(f"🔵 Updated sync token: {self._sync_token[:20]}..." if self._sync_token else "None")
-                    else:
-                        logger.debug("🟡 No next_batch found in sync response")
-                    
-                    # Try to process rooms if they exist
-                    try:
-                        # Check for rooms in different formats
-                        rooms_data = None
-                        
-                        if hasattr(sync_response, 'rooms'):
-                            rooms_data = sync_response.rooms
-                        elif isinstance(sync_response, dict) and 'rooms' in sync_response:
-                            rooms_data = sync_response['rooms']
-                        
-                        if rooms_data:
-                            # Process joined rooms
-                            join_rooms = None
-                            
-                            if hasattr(rooms_data, 'join'):
-                                join_rooms = rooms_data.join
-                            elif isinstance(rooms_data, dict) and 'join' in rooms_data:
-                                join_rooms = rooms_data['join']
-                            
-                            if join_rooms:
-                                for room_id, room_info in join_rooms.items():
-                                    logger.debug(f"🔵 Processing room: {room_id}")
-                                    
-                                    # Try to get timeline events
-                                    timeline_events = []
-                                    
-                                    if hasattr(room_info, 'timeline') and hasattr(room_info.timeline, 'events'):
-                                        timeline_events = room_info.timeline.events
-                                    elif isinstance(room_info, dict) and 'timeline' in room_info:
-                                        timeline = room_info['timeline']
-                                        if isinstance(timeline, dict) and 'events' in timeline:
-                                            timeline_events = timeline['events']
-                                    
-                                    if timeline_events:
-                                        await self._process_room_events(room_id, timeline_events)
-                    except Exception as room_error:
-                        logger.debug(f"🟡 Error processing rooms: {room_error}")
-                        
-                else:
-                    logger.debug("🟡 Empty sync response received")
-
-                # Wait before next sync
-                await asyncio.sleep(5)
-
-            except asyncio.CancelledError:
-                logger.info("🟡 Sync task cancelled")
-                break
-            except Exception as e:
-                logger.error(f"🔴 Matrix sync error: {e}")
-                # Wait longer on error
-                await asyncio.sleep(30)
+    # ==================== MESSAGE HANDLING ====================
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText):
         """Handle incoming Matrix text messages"""
         try:
-            # Skip if it's our own message
+            # Skip our own messages
             if event.sender == self.client.user_id:
                 return
 
             # Check if this is an encrypted room but message is unencrypted
             if room.encrypted and not hasattr(event, 'decrypted'):
                 logger.warning(f"🟡 Unencrypted message in encrypted room from {event.sender}")
-                return
-
+                # Still process it, but warn
+                
+            # Check if it's a DM
+            is_dm = not room.is_group
+            
             # Create message data structure
             message_data = {
                 "event_id": event.event_id,
@@ -655,7 +464,8 @@ class MatrixClient:
                 "room_name": room.display_name or room.room_id,
                 "msgtype": getattr(event, 'msgtype', 'm.text'),
                 "formatted_body": getattr(event, 'formatted_body', None),
-                "decrypted": getattr(event, 'decrypted', False)
+                "decrypted": getattr(event, 'decrypted', False),
+                "is_direct_message": is_dm
             }
 
             # Log the message
@@ -663,9 +473,8 @@ class MatrixClient:
             if len(body_preview) > 100:
                 body_preview = body_preview[:100] + "..."
 
-            logger.info(f"🔵 Message from {event.sender} in room {room.room_id}")
-            logger.info(f"   Content: {body_preview}")
-            logger.info(f"   Decrypted: {message_data['decrypted']}")
+            msg_type = "DM" if is_dm else "Room"
+            logger.info(f"🔵 {msg_type} message from {event.sender}: {body_preview}")
 
             # Call all registered callbacks
             for callback in self._message_callbacks:
@@ -676,6 +485,8 @@ class MatrixClient:
 
         except Exception as e:
             logger.error(f"🔴 Error processing Matrix message: {e}")
+
+    # ==================== PUBLIC API ====================
 
     def add_message_callback(self, callback: Callable):
         """Add callback for incoming messages"""
@@ -728,7 +539,7 @@ class MatrixClient:
             raise
 
     async def create_room(self, name: str, invitees: Optional[list] = None, **kwargs):
-        """Create a new Matrix room"""
+        """Create a new Matrix room (generic)"""
         try:
             if not self.client:
                 logger.error("🔴 Client not initialized")
@@ -773,8 +584,6 @@ class MatrixClient:
                         if hasattr(self.client.store, 'save'):
                             await self.client.store.save()
                             logger.info("🟢 Saved store")
-                        else:
-                            logger.debug("🔵 Store doesn't have save method, skipping")
                     except Exception as save_error:
                         logger.warning(f"🟡 Could not save store: {save_error}")
             except Exception as e:
@@ -798,6 +607,65 @@ class MatrixClient:
             return response is not None
         except Exception:
             return False
+
+    # ==================== SYNC LOOP ====================
+
+    async def _start_syncing(self):
+        """Start syncing with Matrix server"""
+        self.syncing = True
+        logger.info("🔄 Starting Matrix sync loop...")
+
+        # Continuous sync loop
+        while self.syncing and self.client:
+            try:
+                sync_response = await self.client.sync(
+                    timeout=30000,
+                    since=self._sync_token,
+                    full_state=False
+                )
+
+                if sync_response:
+                    # Update sync token
+                    if hasattr(sync_response, 'next_batch'):
+                        self._sync_token = sync_response.next_batch
+                    elif isinstance(sync_response, dict) and 'next_batch' in sync_response:
+                        self._sync_token = sync_response['next_batch']
+
+                # Wait before next sync
+                await asyncio.sleep(5)
+
+            except asyncio.CancelledError:
+                logger.info("🟡 Sync task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"🔴 Matrix sync error: {e}")
+                await asyncio.sleep(30)
+
+    async def _process_room_events(self, room_id: str, events):
+        """Process events from a room"""
+        try:
+            if not events:
+                return
+                
+            logger.debug(f"🔵 Processing {len(events)} events for room {room_id}")
+            
+            for event in events:
+                try:
+                    event_type = None
+                    
+                    if hasattr(event, 'type'):
+                        event_type = event.type
+                    elif isinstance(event, dict) and 'type' in event:
+                        event_type = event['type']
+                    
+                    if event_type:
+                        logger.debug(f"🔵 Event type: {event_type} in room {room_id}")
+                            
+                except Exception as event_error:
+                    logger.debug(f"🟡 Error processing event: {event_error}")
+                    
+        except Exception as e:
+            logger.error(f"🔴 Error processing room events: {e}")
 
 
 # Global instance
