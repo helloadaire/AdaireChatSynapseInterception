@@ -208,6 +208,7 @@ class MatrixClient:
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available (legacy method for nio <0.19)"""
         try:
+            # USE the correct key.
             recovery_key = ELEMENT_KEY_PASSPHRASE
             logger.info("🔵 Attempting to import recovery key...")
 
@@ -352,57 +353,52 @@ class MatrixClient:
             except Exception as e:
                 logger.warning(f"🟡 Direct key request failed: {e}")
                 
-            # Method 2: Try alternative approach - query keys with correct API
+            # Method 2: Try simpler approach
             try:
-                # Fix for API compatibility - try different approaches
+                # Get the user's devices
                 user_id = event.sender
                 
-                # Approach 1: Try without parameters (older API)
+                # Query keys to get device list
                 try:
-                    query_response = await self.client.keys_query()
-                    logger.info("🟢 Keys queried (no parameters)")
+                    query_response = await self.client.keys_query({user_id: []})
                 except TypeError:
-                    # Approach 2: Try with empty dict (newer API)
-                    query_response = await self.client.keys_query({})
-                    logger.info("🟢 Keys queried (empty dict)")
+                    query_response = await self.client.keys_query()
+                
+                # Send key request to each device
+                if hasattr(query_response, 'device_keys') and user_id in query_response.device_keys:
+                    devices = query_response.device_keys[user_id]
                     
-                # If we got a response, try to send key request to all devices
-                if query_response and hasattr(query_response, 'device_keys'):
-                    devices = query_response.device_keys.get(user_id, {})
-                    
-                    if not devices:
-                        # Try to fetch device list separately
-                        logger.info(f"🔑 No devices in query response, trying device list for {user_id}")
-                        # We'll skip device-specific requests for now
-                        return
-                        
-                    for device_id in devices.keys():
-                        logger.info(f"🔑 Sending key request to device {device_id}")
-                        
-                        # Create a key request
-                        request_content = {
-                            "action": "request",
-                            "requesting_device_id": self.client.device_id,
-                            "request_id": f"req_{int(time.time())}",
-                            "body": {
-                                "algorithm": "m.megolm.v1.aes-sha2",
-                                "room_id": room.room_id,
-                                "sender_key": sender_key,
-                                "session_id": session_id,
-                            }
-                        }
-                        
-                        # Send to-device message requesting keys
-                        await self.client.to_device(
-                            "m.room_key_request",
-                            {
-                                user_id: {
-                                    device_id: request_content
+                    for device_id, device_info in devices.items():
+                        if isinstance(device_info, dict) and 'type' in device_info:
+                            # This is a device info dict, not a string
+                            logger.info(f"🔑 Sending key request to device {device_id}")
+                            
+                            # Create a proper key request
+                            request_id = f"req_{int(time.time())}_{session_id[:8]}"
+                            
+                            # Send to-device message
+                            await self.client.to_device(
+                                "m.room_key_request",
+                                {
+                                    user_id: {
+                                        device_id: {
+                                            "action": "request",
+                                            "requesting_device_id": self.client.device_id,
+                                            "request_id": request_id,
+                                            "body": {
+                                                "algorithm": "m.megolm.v1.aes-sha2",
+                                                "room_id": room.room_id,
+                                                "sender_key": sender_key,
+                                                "session_id": session_id,
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                        )
-                        logger.info(f"🟢 Key request sent to {device_id}")
-                        
+                            )
+                            logger.info(f"🟢 Key request sent to {device_id}")
+                        else:
+                            logger.debug(f"🔵 Skipping device {device_id} - invalid format")
+                            
             except Exception as e:
                 logger.warning(f"🟡 Device key request failed: {e}")
                 
