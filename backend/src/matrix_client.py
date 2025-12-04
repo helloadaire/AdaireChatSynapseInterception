@@ -255,59 +255,17 @@ class MatrixClient:
         except Exception as e:
             logger.error(f"🔴 Error importing recovery key: {e}", exc_info=True)
 
-    async def request_session_keys_aggressively(self, user_id: str, room_id: str):
-        """Forcefully request session keys from a user"""
-        try:
-            logger.info(f"🔑 Aggressively requesting session keys from {user_id}")
-            
-            # First, mark the user's device as trusted
-            response = await self.client.query_keys({user_id: []})
-            
-            if user_id in response.device_keys:
-                for device_id in response.device_keys[user_id].keys():
-                    # Mark device as verified/trusted
-                    await self.client.set_device_verified(user_id, device_id, verified=True)
-                    logger.info(f"🔐 Marked device {device_id} as verified")
-                    
-                    # Send key request
-                    await self.client.to_device(
-                        "m.room_key_request",
-                        {
-                            user_id: {
-                                device_id: {
-                                    "action": "request",
-                                    "requesting_device_id": self.client.device_id,
-                                    "request_id": f"force_req_{int(time.time())}",
-                                    "body": {
-                                        "algorithm": "m.megolm.v1.aes-sha2",
-                                        "room_id": room_id,
-                                        "sender_key": "",  # This will request all session keys
-                                        "session_id": "",  # Empty means all sessions
-                                    }
-                                }
-                            }
-                        }
-                    )
-                    logger.info(f"🟢 Sent aggressive key request to {device_id}")
-                    
-        except Exception as e:
-            logger.error(f"🔴 Failed to aggressively request keys: {e}")
-
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
-            # Skip our own messages
-            if event.sender == self.client.user_id:
-                logger.debug("🔵 Skipping encrypted message from ourselves")
-                return
-                
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
             
             # First check if we can decrypt
             if self.client and self.client.olm:
                 try:
+                    # In nio <0.19, use decrypt_event directly
                     decrypted = await self.client.decrypt_event(event)
-                    
+
                     if decrypted and hasattr(decrypted, 'body'):
                         # Successfully decrypted!
                         message_data = {
@@ -328,17 +286,16 @@ class MatrixClient:
                         for callback in self._message_callbacks:
                             await callback(message_data)
                         return
-                    
+                            
                 except Exception as decrypt_error:
-                    logger.info(f"🔑 Decryption failed: {decrypt_error}")
+                    error_msg = str(decrypt_error)
+                    logger.info(f"🔑 Decryption failed: {error_msg}")
                     
-                    # Try aggressive key request
-                    await self.request_session_keys_aggressively(event.sender, room.room_id)
+                    # If decryption failed, try to restore from backup
+                    logger.info("🔑 No key stored — trying recovery key restore")
+                    await self._import_recovery_key_if_exists()
                     
-                    # Wait a bit for key response
-                    await asyncio.sleep(2)
-                    
-                    # Try decryption again
+                    # Try decryption again after restore attempt
                     try:
                         decrypted = await self.client.decrypt_event(event)
                         
@@ -362,8 +319,8 @@ class MatrixClient:
                             for callback in self._message_callbacks:
                                 await callback(message_data)
                             return
-                    except:
-                        logger.warning("🔑 Still cannot decrypt after aggressive request")
+                    except Exception as second_decrypt_error:
+                        logger.warning(f"🔑 Still cannot decrypt after restore: {second_decrypt_error}")
 
             # If we get here, decryption failed
             logger.info(f"🔑 No decryption key for event from {event.sender}")
@@ -396,52 +353,57 @@ class MatrixClient:
             except Exception as e:
                 logger.warning(f"🟡 Direct key request failed: {e}")
                 
-            # Method 2: Try simpler approach
+            # Method 2: Try alternative approach - query keys with correct API
             try:
-                # Get the user's devices
+                # Fix for API compatibility - try different approaches
                 user_id = event.sender
                 
-                # Query keys to get device list
+                # Approach 1: Try without parameters (older API)
                 try:
-                    query_response = await self.client.keys_query({user_id: []})
-                except TypeError:
                     query_response = await self.client.keys_query()
-                
-                # Send key request to each device
-                if hasattr(query_response, 'device_keys') and user_id in query_response.device_keys:
-                    devices = query_response.device_keys[user_id]
+                    logger.info("🟢 Keys queried (no parameters)")
+                except TypeError:
+                    # Approach 2: Try with empty dict (newer API)
+                    query_response = await self.client.keys_query({})
+                    logger.info("🟢 Keys queried (empty dict)")
                     
-                    for device_id, device_info in devices.items():
-                        if isinstance(device_info, dict) and 'type' in device_info:
-                            # This is a device info dict, not a string
-                            logger.info(f"🔑 Sending key request to device {device_id}")
-                            
-                            # Create a proper key request
-                            request_id = f"req_{int(time.time())}_{session_id[:8]}"
-                            
-                            # Send to-device message
-                            await self.client.to_device(
-                                "m.room_key_request",
-                                {
-                                    user_id: {
-                                        device_id: {
-                                            "action": "request",
-                                            "requesting_device_id": self.client.device_id,
-                                            "request_id": request_id,
-                                            "body": {
-                                                "algorithm": "m.megolm.v1.aes-sha2",
-                                                "room_id": room.room_id,
-                                                "sender_key": sender_key,
-                                                "session_id": session_id,
-                                            }
-                                        }
-                                    }
+                # If we got a response, try to send key request to all devices
+                if query_response and hasattr(query_response, 'device_keys'):
+                    devices = query_response.device_keys.get(user_id, {})
+                    
+                    if not devices:
+                        # Try to fetch device list separately
+                        logger.info(f"🔑 No devices in query response, trying device list for {user_id}")
+                        # We'll skip device-specific requests for now
+                        return
+                        
+                    for device_id in devices.keys():
+                        logger.info(f"🔑 Sending key request to device {device_id}")
+                        
+                        # Create a key request
+                        request_content = {
+                            "action": "request",
+                            "requesting_device_id": self.client.device_id,
+                            "request_id": f"req_{int(time.time())}",
+                            "body": {
+                                "algorithm": "m.megolm.v1.aes-sha2",
+                                "room_id": room.room_id,
+                                "sender_key": sender_key,
+                                "session_id": session_id,
+                            }
+                        }
+                        
+                        # Send to-device message requesting keys
+                        await self.client.to_device(
+                            "m.room_key_request",
+                            {
+                                user_id: {
+                                    device_id: request_content
                                 }
-                            )
-                            logger.info(f"🟢 Key request sent to {device_id}")
-                        else:
-                            logger.debug(f"🔵 Skipping device {device_id} - invalid format")
-                            
+                            }
+                        )
+                        logger.info(f"🟢 Key request sent to {device_id}")
+                        
             except Exception as e:
                 logger.warning(f"🟡 Device key request failed: {e}")
                 
