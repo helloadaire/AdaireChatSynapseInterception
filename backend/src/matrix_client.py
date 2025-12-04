@@ -208,12 +208,7 @@ class MatrixClient:
     async def _import_recovery_key_if_exists(self):
         """Import recovery key from settings if available (legacy method for nio <0.19)"""
         try:
-            recovery_key = getattr(settings, "matrix_recovery_key", None)
-            if not recovery_key:
-                logger.warning("🟡 No recovery key provided in settings")
-                # recovery_key = ELEMENT_KEY_PASSPHRASE
-                logger.info("🟡 Using hardcoded recovery key")
-
+            recovery_key = ELEMENT_KEY_PASSPHRASE
             logger.info("🔵 Attempting to import recovery key...")
 
             # In nio <0.19, we need to use a different approach
