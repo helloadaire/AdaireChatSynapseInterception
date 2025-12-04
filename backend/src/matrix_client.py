@@ -258,14 +258,18 @@ class MatrixClient:
     async def _on_encrypted(self, room: MatrixRoom, event: MegolmEvent):
         """Handle encrypted Megolm events"""
         try:
+            # Skip our own messages
+            if event.sender == self.client.user_id:
+                logger.debug("🔵 Skipping encrypted message from ourselves")
+                return
+                
             logger.info(f"🔵 Received encrypted event from {event.sender} in room {room.room_id}")
             
             # First check if we can decrypt
             if self.client and self.client.olm:
                 try:
-                    # In nio <0.19, use decrypt_event directly
                     decrypted = await self.client.decrypt_event(event)
-
+                    
                     if decrypted and hasattr(decrypted, 'body'):
                         # Successfully decrypted!
                         message_data = {
@@ -286,16 +290,17 @@ class MatrixClient:
                         for callback in self._message_callbacks:
                             await callback(message_data)
                         return
-                            
+                    
                 except Exception as decrypt_error:
-                    error_msg = str(decrypt_error)
-                    logger.info(f"🔑 Decryption failed: {error_msg}")
+                    logger.info(f"🔑 Decryption failed: {decrypt_error}")
                     
-                    # If decryption failed, try to restore from backup
-                    logger.info("🔑 No key stored — trying recovery key restore")
-                    await self._import_recovery_key_if_exists()
+                    # Try aggressive key request
+                    await self.request_session_keys_aggressively(event.sender, room.room_id)
                     
-                    # Try decryption again after restore attempt
+                    # Wait a bit for key response
+                    await asyncio.sleep(2)
+                    
+                    # Try decryption again
                     try:
                         decrypted = await self.client.decrypt_event(event)
                         
@@ -319,8 +324,8 @@ class MatrixClient:
                             for callback in self._message_callbacks:
                                 await callback(message_data)
                             return
-                    except Exception as second_decrypt_error:
-                        logger.warning(f"🔑 Still cannot decrypt after restore: {second_decrypt_error}")
+                    except:
+                        logger.warning("🔑 Still cannot decrypt after aggressive request")
 
             # If we get here, decryption failed
             logger.info(f"🔑 No decryption key for event from {event.sender}")
