@@ -211,7 +211,7 @@ class MatrixClient:
             recovery_key = getattr(settings, "matrix_recovery_key", None)
             if not recovery_key:
                 logger.warning("🟡 No recovery key provided in settings")
-                recovery_key = ELEMENT_KEY_PASSPHRASE
+                # recovery_key = ELEMENT_KEY_PASSPHRASE
                 logger.info("🟡 Using hardcoded recovery key")
 
             logger.info("🔵 Attempting to import recovery key...")
