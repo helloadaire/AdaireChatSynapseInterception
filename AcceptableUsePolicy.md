@@ -1,6 +1,6 @@
 # Adaire Chat Terms of Use
 
-**Effective Date:** *(To be specified)*
+**Effective Date:** *(2025-21-19)*
 
 Welcome to Adaire Chat! By downloading, accessing, or using our mobile application (the "App"), you agree to comply with these Terms of Use ("Terms"). Please read them carefully.
 
