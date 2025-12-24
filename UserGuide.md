@@ -24,22 +24,23 @@
 
 
 ## Enter your username and password, then tap Continue.
-![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-07.png?raw=true)
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-pwd.png?raw=true)
 
 ## Tap Enter recovery key.
-![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-08.png?raw=true)
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-07.png?raw=true)
 
 
 ## Input your recovery key and tap Continue.
-![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-09.png?raw=true)
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-08.png?raw=true)
 
 
 ## On the Device Verified screen, tap Continue.
-![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-10.png?raw=true)
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-9.png?raw=true)
 
 
 ## On the Help improve Adaire Chat screen, tap Not now.
-![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-11.png?raw=true)
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-10.png?raw=true)
 
 
 ## You will land on the Home screen, where you can start using Adaire Chat messaging features.
+![User guide screenshot](https://github.com/helloadaire/AdaireChatSynapseInterception/blob/main/assets/user-guide-11.png?raw=true)
